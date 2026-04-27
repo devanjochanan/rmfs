@@ -1,0 +1,26 @@
+Kesimpulan meeting selanjutnya:
+Searched POA method:
+1. Deep reinforcement learning driven cost minimization for batch order scheduling in robotic mobile fulfillment systems
+RL yang decisionnya tu milih heuristic method untuk apply POA ke systemnya
+2. Simultaneous allocation and sequencing of orders for robotic mobile fulfillment system using reinforcement learning algorithm
+Quite good, basically RLnya:
+- Action : allocate order to robot
+
+Order batching from previous thesis:
+1. Emily
+No order batching is used because order batching requires waiting for a certain amount of time or a specific number of orders, which can result in idle picking stations. Therefore, this study adopts the FCFS assignment rule to avoid these issues.
+
+2. Aisyahna
+orders are grouped based on SKU similarity using jaccard index. each group becomes 1 batch and assigned to a station. max batches = number of picking station
+Flow:
+every 5 ticks:
+check available bins
+calculate pairwise jaccard similarity for each 2 orders
+batch orders in to (n available stations) batches based on similarity
+
+calculate sku similarity between current SKU demand for each station
+assign each batch to a station 
+
+
+Tried to implement full POA+PPS reinforcement learning, conclusion:
+- After 1702 episodes of 3000 ticks, reward doesnt look like training

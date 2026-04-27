@@ -1,0 +1,202 @@
+================================================================================
+CHANGE LOG: Joint POA + PPS RL Implementation
+Date: 2026-04-14
+================================================================================
+
+OVERVIEW
+--------
+Implemented an integrated RL system where a single PPO agent controls both
+Pick Order Assignment (POA) and Pick Pod Selection (PPS) jointly. Also
+implemented Aisyahna's Similarity-Based Order Batching + POA as a separate
+heuristic method, and fixed a Dijkstra crash bug.
+
+================================================================================
+CHANGE 1: Aisyahna's Similarity-Based Order Batching + POA
+File: model/inventory.py
+================================================================================
+
+What was added:
+- New flag: self.poa_aisyahna (default True when not using joint RL)
+- New parameters: self.aisyahna_batch_interval (5 ticks),
+  self._aisyahna_last_batch_tick (timer tracker)
+- New static method: _jaccard_similarity(skus_a, skus_b)
+  Formula: Sim(A,B) = (shared / |A|) * (shared / |B|)
+- New method: aisyahna_poa()
+
+Algorithm flow:
+  Step 1: Timer fires every 5 ticks
+  Step 2: Count free bins across all stations
+  Step 3: Take candidate orders from pool (up to total free bins)
+  Step 4: Build pairwise Jaccard similarity matrix between candidates
+  Step 5: Group orders into batches (one per available station) using
+          seed selection (highest total similarity) + nearest-seed clustering
+  Step 6: Compare each batch's collective SKUs to each station's active SKUs
+          using greedy matching (highest similarity pair first)
+  Step 7: Trim batches to fit station capacity
+  Step 8: Execute assignment via put_order_to_picking_station()
+
+process_orders() updated:
+  When poa_aisyahna is True, calls aisyahna_poa() directly and skips
+  old threshold-based batching and other POA methods.
+
+================================================================================
+CHANGE 2: Joint POA + PPS RL Environment
+File: joint_env.py (NEW)
+================================================================================
+
+New Gymnasium environment: JointEnv
+
+Architecture:
+- Single centralized PPO agent (warehouse controller)
+- One step = one (order, station, pod) assignment decision
+- Agent is called repeatedly while decisions are possible, then simulation
+  advances until next trigger
+
+Action space: MultiDiscrete([50, 3, 60])
+  - order_index (0-49): which unassigned order to pick from pool
+  - station_index (0-2): which station to assign it to
+  - pod_index (0-59): which pod to send to that station
+
+Observation space (Dict):
+  station_features: (3 stations x 53 features)
+    - Free bin count (normalized by 8)
+    - Active order count (normalized by 8)
+    - SKU demand vector (top 50 SKUs, normalized)
+    - Incoming pod count (normalized by 11)
+
+  order_features: (50 order slots x 52 features)
+    - SKU requirement vector (top 50 SKUs, normalized by 12)
+    - Total items needed (normalized by 50)
+    - Wait time in ticks since arrival (normalized by 3000)
+
+  pod_features: (60 pod slots x 57 features)
+    - SKU inventory vector (top 50 SKUs, normalized by 100)
+    - Is idle flag (1.0 for all, since only idle pods included)
+    - Distance to each station (3 values, inverted Manhattan, normalized by 80)
+    - Match degree with each station demand (3 values, normalized)
+
+  num_orders: (1,) actual count of unassigned orders
+  num_pods: (1,) actual count of idle pods
+
+Action validation (Step 5):
+  - order_index out of range: clamped via modulo
+  - station full: redirected to station with most free bins
+  - pod busy: replaced with nearest idle pod to chosen station
+
+Execution (Step 6):
+  - POA: assign order to station, update CSV, start processing timer
+  - PPS: aggregate station SKU demand, build order map, create picking job
+         via add_picking_task_after_pps(), add to job queue
+
+Reward: pile_on_rate_delta - 0.001 * avg_completion_time_delta
+
+Decision loop (Step 9):
+  After each step, checks if more decisions possible (unassigned order > 0
+  AND free bin > 0 AND idle pod > 0). If yes, returns immediately for next
+  decision. If no, advances simulation ticks until trigger fires again.
+
+Episode ends when: all orders completed OR max ticks reached (default 3000).
+
+================================================================================
+CHANGE 3: Joint RL Training Script
+File: train_joint_rl.py (NEW)
+================================================================================
+
+Training script using Stable-Baselines3 PPO with DummyVecEnv.
+
+Features:
+- TensorBoard logging in 2 sections:
+  - joint_reward/: total_reward, pile_on_rate, avg_order_completion_time
+  - joint_metrics/: throughput, cumulative_path_cost, episode_steps
+- CSV metrics recording per episode
+- Model checkpoints every 10 episodes
+- Best model saved on throughput improvement
+- Resume support via saved_models/joint/train_state.json
+- Evaluation mode with --eval flag
+
+Paths:
+  Models:      saved_models/joint/
+  TensorBoard: saved_models/joint_runs/
+  Metrics CSV: saved_models/joint_metrics/
+  Checkpoints: saved_models/joint/checkpoints/
+
+Usage:
+  Train:    python train_joint_rl.py --episodes 500 --max-ticks 3000
+  Resume:   python train_joint_rl.py --resume --episodes 500
+  Evaluate: python train_joint_rl.py --eval
+  View:     tensorboard --logdir saved_models/joint_runs
+
+CLI arguments:
+  --episodes    Number of episodes (default 50)
+  --max-ticks   Max simulation ticks per episode (default 3000)
+  --n-steps     Steps per PPO rollout (default 4096)
+  --lr          Learning rate (default 3e-4)
+  --batch-size  Minibatch size (default 64)
+  --epochs      PPO epochs per update (default 10)
+  --gamma       Discount factor (default 0.99)
+  --ent-coef    Entropy coefficient (default 0.01)
+
+================================================================================
+CHANGE 4: Joint RL Flag in Inventory
+File: model/inventory.py
+================================================================================
+
+Added:
+- self.joint_rl = False (line 99)
+
+When joint_rl is True, process_orders() skips all POA and PPS logic.
+Only keeps the order start-processing timer update so that orders assigned
+by the joint env get their process_start_time set correctly.
+
+The joint env (joint_env.py) sets these flags on warehouse creation:
+  warehouse.poa_podmatch = False
+  warehouse.poa_first = False
+  warehouse.poa_second = False
+  warehouse.poa_aisyahna = False
+  warehouse.pps_pileon = False
+  warehouse.pps_demand = False
+  warehouse.pps_rl = True
+  warehouse.joint_rl = True
+
+================================================================================
+CHANGE 5: Dijkstra Crash Fix
+File: netlogo.py
+================================================================================
+
+Bug: NetworkXError "The node 3,0 is not in the digraph" when Dijkstra's
+     nodes_to_avoid list contained coordinates that are not graph nodes.
+
+Root cause: Robot snapping moved the start position to a valid graph node,
+but the avoid_coords calculation generated neighbor coordinates (like 3,0)
+that are not in the graph. Dijkstra then called G.neighbors("3,0") which
+crashed because that node doesn't exist.
+
+Fix: Added guard in both dijkstra() and dijkstra_modified() methods:
+  if node not in G:
+      continue
+This skips avoid nodes that aren't in the graph instead of crashing.
+
+Applied to both occurrences (line ~111 and line ~153).
+
+================================================================================
+SUMMARY OF FLAGS
+================================================================================
+
+POA methods (set exactly one to True):
+  self.poa_podmatch   = Baseline Pod-Match
+  self.poa_first      = Future-Aware with preassign
+  self.poa_second     = Rika's method (xxx)
+  self.poa_aisyahna   = Aisyahna's similarity batching
+
+PPS methods:
+  self.pps_pileon     = Heuristic pile-on
+  self.pps_demand     = Heuristic demand-based
+  self.pps_rl         = RL-controlled PPS only (via PPSEnv)
+
+Joint RL:
+  self.joint_rl       = RL controls both POA and PPS (via JointEnv)
+  (when True, all poa_* and pps_* are set to False by the env)
+
+================================================================================
+END OF CHANGE LOG
+================================================================================

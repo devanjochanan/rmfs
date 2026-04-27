@@ -1,0 +1,99 @@
+Start
+Inputs:
+
+- Backlog orders (unassigned order pool)
+- Number of picking stations (3)
+- Bin capacity at each station (8 max)
+- SKU requirements for each order
+- Current active orders at each station
+- List of all pods with their SKU inventories
+- Pod idle/busy status
+- Pod distance to each station
+
+Step 1: Check decision trigger
+Condition: If unassigned order >0
+
+No → wait until there is an unprocessed order
+Yes → Continue
+
+Step 2: Check bin availability
+Condition: if available station bin >0
+
+No → go back to step 1
+Yes → Continue
+
+Step 3: Build observation
+Gather the full warehouse state for the agent:
+
+Station features (per station):
+
+- bin status of each bin
+- unprocessed order information
+- station SKU demand vector (what SKUs the station currently needs and how many)
+
+Order pool features (per unassigned order):
+
+- SKU requirement and the quantity (what SKUs this order needs and how many)
+- How long the order has been waiting (ticks since arrival)
+
+Pod features (per pod):
+
+- SKU inventory vector (what SKUs this pod has and how many)
+- Pod status (idle or busy(is on the way? or empty?))
+- Distance to each station
+- station demand and pod match degree
+
+Step 4: Agent makes decision
+
+Feed observation to the PPO model. Agent outputs one action:
+
+
+action = [order_index, station_index, pod_index]
+order_index → which order from the pool to pick
+station_index → which station to assign it to
+pod_index → which pod to send to that station
+
+Step 5: Validate action
+
+If order_index is out of range → clamp to valid range
+If station_index points to a full station → reassign to station with most free bins
+If pod_index points to a busy pod → select nearest idle pod to the chosen station instead
+
+Step 6: Execute POA
+
+Remove selected order from the pool
+Assign order to the selected station
+Add order to station's active order list
+Update station's free bin count
+Step B5: Execute PPS
+
+Aggregate SKU demand at the selected station (including the newly assigned order)
+Build SKU-to-order map for the selected pod against the station's orders
+Create picking job (list of order_id, sku, quantity triplets)
+Mark pod as busy
+Add job to job queue
+
+Step 7: Calculate reward
+
+reward = pile_on_delta - α × avg_completion_time_delta
+Where:
+
+pile_on_delta = change in pile-on rate from previous step
+avg_completion_time_delta = change in average order completion time
+path_cost_delta = change in cumulative path cost (pod travel distance)
+α, β = weighting coefficients (tunable)
+
+Step 8: Record metrics
+
+Order fulfillment time
+Pile-on rate (items picked per pod visit)
+Throughput (orders completed per unit time)
+Cumulative path cost
+
+Step 9: Check if more decisions needed
+
+Condition: Still at least 1 unassigned order AND at least 1 station with free bin AND at least 1 idle pod?
+
+Yes → Loop back to step 3 (agent makes another decision immediately)
+No → Advance simulation ticks until condition is met again → Loop back to Step 1
+End Condition

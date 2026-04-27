@@ -1,0 +1,6 @@
+{
+    "github.copilot.enable": {
+        "*": false
+    },
+    "python.defaultInterpreterPath": "C:\\Users\\Devan\\AppData\\Local\\Programs\\Python\\Python311\\python.exe"
+}

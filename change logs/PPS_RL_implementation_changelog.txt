@@ -1,0 +1,304 @@
+================================================================================
+CHANGE LOG: PPS (Pick Pod Selection) RL Implementation
+Date: 2026-04-07
+Author: Claude (AI Assistant)
+================================================================================
+
+OVERVIEW
+--------
+This change log documents the implementation of a Reinforcement Learning (RL)
+based Pick Pod Selection (PPS) system using PPO (Proximal Policy Optimization)
+for the RMFS (Robotic Mobile Fulfillment System) warehouse simulation.
+
+The changes include:
+  1. Reducing picking stations from 5 to 3
+  2. A new Gymnasium environment wrapper for PPS decisions (pps_env.py)
+  3. Modifications to inventory.py to support RL-controlled PPS
+  4. A PPO training script with per-episode weight updates (train_pps_rl.py)
+  5. TensorBoard integration and CSV data recording
+
+================================================================================
+FILE CHANGES
+================================================================================
+
+--------------------------------------------------------------------------------
+1. model/layout.py  (Line 15)
+--------------------------------------------------------------------------------
+CHANGE: Reduced order_picker_total from 5 to 3
+
+BEFORE:
+    self.order_picker_total = 5
+
+AFTER:
+    self.order_picker_total = 3
+
+WHY: The methodology specifies 3 picking stations. Station IDs will now be
+     picker-0, picker-1, picker-2. The layout generator dynamically creates
+     stations based on this value, so no other hardcoded station references
+     need updating.
+
+--------------------------------------------------------------------------------
+2. model/inventory.py  (Lines 85-87, Lines 413-414)
+--------------------------------------------------------------------------------
+CHANGE A: Added pps_rl flag (Line 87)
+
+BEFORE:
+    self.pps_pileon = True
+    self.pps_demand = False
+
+    self.priority_order = False
+
+AFTER:
+    self.pps_pileon = True
+    self.pps_demand = False
+    self.pps_rl = False       # When True, PPS is controlled by RL agent (PPSEnv)
+
+    self.priority_order = False
+
+WHY: The new flag allows the external RL environment (PPSEnv) to take over
+     pod selection decisions. When pps_rl=True, the internal heuristic PPS
+     logic is skipped entirely.
+
+CHANGE B: Added early return in process_orders() when pps_rl is active (Line 413)
+
+BEFORE:
+    # Step 6: Process PPS logic
+    if self.pps_demand or self.pps_pileon:
+
+AFTER:
+    # Step 6: Process PPS logic (skip when RL controls PPS)
+    if self.pps_rl:
+        return  # RL agent handles PPS externally via PPSEnv
+    if self.pps_demand or self.pps_pileon:
+
+WHY: When RL controls PPS, the simulation's built-in pod selection logic
+     must be bypassed. The RL agent (PPSEnv) calls add_picking_task_after_pps()
+     directly after making its own pod-station assignment decisions. The POA
+     (order assignment) logic still runs normally - only PPS is replaced.
+
+--------------------------------------------------------------------------------
+3. pps_env.py  (NEW FILE - 420 lines)
+--------------------------------------------------------------------------------
+PURPOSE: Gymnasium-compliant environment wrapper that exposes PPS decisions
+         as an RL problem for PPO training.
+
+ARCHITECTURE:
+  - Each RL "step" corresponds to one PPS decision round in the warehouse.
+  - Between steps, the warehouse simulation runs its tick loop (order arrival,
+    robot movement, picking, POA) until the next PPS decision is needed.
+
+AGENT DESIGN:
+  - Agent: Idle pods (up to MAX_PODS_OBS=60 at a time)
+  - Each pod independently decides one of 4 actions
+
+ACTION SPACE:
+  - MultiDiscrete([4] * 60)  ->  60 pods, each picks action 0-3
+  - Action 0: pod stays unassigned (do nothing)
+  - Action 1: pod assigned to picker-0
+  - Action 2: pod assigned to picker-1
+  - Action 3: pod assigned to picker-2
+
+OBSERVATION SPACE (Dict):
+  - "pod_features": Box(60, 56) float32
+      Per-pod feature vector of dimension 56:
+        [0:50]  = Top-50 SKU quantities in pod (normalized by /100, capped at 1.0)
+        [50:53] = Distance to each of 3 stations (normalized, inverted: 1=close, 0=far)
+        [53:56] = Match degree with each station's demand (ratio of matchable SKUs)
+  - "num_candidates": Box(1,) int32
+      Actual number of candidate pods (rest are zero-padded)
+  - "action_mask": Box(60, 4) int8
+      Binary mask: 1=valid action, 0=invalid
+      Action 0 (unassigned) is always valid
+      Station actions invalid if station has max robots
+
+REWARD FUNCTION:
+  reward = pile_on_rate_delta - alpha * avg_order_completion_time_delta
+  Where:
+    pile_on_rate_delta = items_picked / pod_visits (since last step)
+    alpha = 0.001 (configurable via reward_alpha parameter)
+    avg_order_completion_time_delta = mean completion time of newly finished orders
+
+  This encourages the agent to:
+    - Maximize pile-on (pick more items per pod visit)
+    - Minimize order completion time
+
+EPISODE TERMINATION:
+  - terminated=True when all orders are completed
+  - truncated=True when simulation reaches max_episode_ticks (default 32400 = 9h)
+
+KEY METHODS:
+  Line  30: class PPSEnv(gym.Env)
+  Line 112: reset() -> creates fresh warehouse, advances to first PPS point
+  Line 138: step(action) -> executes assignments, advances sim, computes reward
+  Line 160: _create_warehouse() -> initializes Inventory with pps_rl=True
+  Line 183: _build_sku_index() -> maps top-50 SKUs to feature indices
+  Line 194: _get_candidate_pods() -> filters idle pods with matching demand SKUs
+  Line 225: _build_observation() -> constructs the observation dict
+  Line 291: _execute_assignments(actions) -> converts RL actions to pod-station jobs
+  Line 345: _advance_to_next_pps_point() -> runs sim ticks until next PPS needed
+  Line 381: _pps_decision_needed() -> checks if stations have demand + idle pods exist
+  Line 399: _update_episode_metrics() -> tallies completed orders and times
+  Line 414: _compute_reward() -> pile_on - alpha * avg_completion_time
+
+HEURISTIC FALLBACK (Branch A / Branch B):
+  When use_heuristic_fallback=True (default), the environment can fall back
+  to the existing heuristic PPS logic if the RL agent assigns action 0 to all
+  pods. This supports the methodology's Branch A (early/non-trained phase)
+  vs Branch B (RL-trained phase) design.
+
+DATA TYPES COLLECTED IN INFO DICT (returned every step):
+  - orders_completed (int): total orders finished so far in episode
+  - avg_order_completion_time (float): mean ticks from assignment to completion
+  - pile_on_rate (float): avg items per pod visit
+  - pile_on_items (int): total items picked across all visits
+  - pile_on_visits (int): total pod-to-station visits
+  - cumulative_path_cost (float): total robot energy consumption
+  - throughput (int): same as orders_completed
+  - tick (float): current simulation tick
+  - step (int): current RL step count
+
+--------------------------------------------------------------------------------
+4. train_pps_rl.py  (NEW FILE - 370 lines)
+--------------------------------------------------------------------------------
+PURPOSE: PPO training script with per-episode weight updates, TensorBoard
+         logging, and CSV metric recording.
+
+PER-EPISODE UPDATE MECHANISM:
+  Unlike standard SB3 PPO which updates every n_steps, this script:
+    1. Runs one full episode (reset -> step until done)
+    2. Collects all transitions
+    3. Sets model.n_steps = episode_length
+    4. Calls model.learn(total_timesteps=n_steps) for exactly one PPO update
+    5. Repeats for total_episodes
+  This ensures weights are updated once per complete warehouse simulation episode.
+
+PPO HYPERPARAMETERS (configurable via CLI):
+  - Policy: MultiInputPolicy (handles Dict observation space)
+  - Learning rate: 3e-4 (default)
+  - Batch size: 64
+  - PPO epochs per update: 10
+  - Gamma (discount): 0.99
+  - GAE lambda: 0.95
+  - Clip range: 0.2
+  - Entropy coefficient: 0.01
+  - Value function coefficient: 0.5
+  - Max gradient norm: 0.5
+
+TENSORBOARD METRICS (viewable via `tensorboard --logdir pps_rl_logs`):
+  Per-episode scalars (x-axis = episode number):
+    - pps_episode/throughput              : orders completed
+    - pps_episode/cumulative_path_cost    : total robot energy
+    - pps_episode/pile_on_rate            : items per pod visit
+    - pps_episode/avg_order_completion_time: avg ticks per order
+    - pps_episode/total_reward            : sum of step rewards
+    - pps_episode/episode_steps           : RL decision count
+    - pps_episode/episode_time_sec        : wall-clock seconds
+    - pps_episode/pile_on_items           : total items picked
+    - pps_episode/pile_on_visits          : total pod visits
+
+CSV METRICS (saved to pps_rl_metrics/metrics_<run_name>.csv):
+  Columns:
+    episode (int)                    - episode number
+    timestamp (str)                  - wall-clock ISO timestamp
+    throughput (int)                 - orders completed
+    cumulative_path_cost (float)     - total robot energy
+    pile_on_rate (float)             - items per pod visit
+    pile_on_items (int)              - total items picked
+    pile_on_visits (int)             - total pod visits
+    avg_order_completion_time (float)- avg ticks per order
+    total_reward (float)             - episode reward sum
+    episode_steps (int)              - RL steps in episode
+    sim_ticks (float)                - simulation ticks elapsed
+
+MODEL CHECKPOINTS:
+  - Best model:     pps_rl_models/pps_ppo_best.zip
+  - Every 10 eps:   pps_rl_models/checkpoints/pps_ppo_ep{N}.zip
+  - Final model:    pps_rl_models/pps_ppo_final.zip
+
+USAGE:
+  # Train (per-episode updates, default)
+  python train_pps_rl.py --episodes 50
+
+  # Train with custom hyperparameters
+  python train_pps_rl.py --episodes 100 --lr 1e-4 --batch-size 128 --epochs 20
+
+  # Resume training from checkpoint
+  python train_pps_rl.py --resume --episodes 50
+
+  # Standard SB3 training (fixed n_steps, not per-episode)
+  python train_pps_rl.py --standard --timesteps 100000
+
+  # Evaluate trained model
+  python train_pps_rl.py --eval
+
+  # View TensorBoard
+  tensorboard --logdir pps_rl_logs
+
+KEY CLASSES:
+  Line  47: PPSMetricsCallback(BaseCallback) - SB3 callback for TensorBoard
+  Line 101: MetricsRecorder - CSV writer for per-episode data
+  Line 156: train_per_episode() - main per-episode training loop
+  Line 296: train_standard() - alternative standard SB3 training
+  Line 330: evaluate() - model evaluation
+
+================================================================================
+METHODOLOGY MAPPING
+================================================================================
+
+The implementation follows the user's specified methodology:
+
+1. ORDER BATCHING & POA (unchanged, handled by inventory.py xxx() method):
+   - Step 1: Check unprocessed orders > 5 -> wait 15s if not
+   - Step 2: Check bin availability >= 1
+   - Step 3: Check extra bin at other station
+   - Step 4: Compare future vs current fulfillment scores
+   - Step 5: Update bin availability
+   Output: assigned order demands sent to PPS
+
+2. PPS (now RL-controlled via pps_env.py):
+   Branch A (heuristic fallback - early/non-trained):
+     - Filter pods with >= 1 matching SKU
+     - Calculate supply rate per pod
+     - Tie-break by shortest travel distance
+
+   Branch B (RL-trained):
+     - Filter idle pods only
+     - Extract features per pod:
+       a. SKU quantities (top-50 vector)
+       b. Distance to all 3 stations (Manhattan, normalized)
+       c. Station demand-pod match degree (ratio)
+     - PPO model outputs one of:
+       0 = pod unassigned
+       1 = pod assigned to picker-0
+       2 = pod assigned to picker-1
+       3 = pod assigned to picker-2
+
+   Step 3: Record order fulfillment time + pile-on
+   Step 4: Update station demands, loop until all fulfilled
+
+3. REWARD: pile_on - alpha * avg_order_completion_time
+
+================================================================================
+DIRECTORY STRUCTURE (new files/folders)
+================================================================================
+
+Fresh Start Main RMFS/
+  pps_env.py                    <- NEW: Gymnasium environment for PPS RL
+  train_pps_rl.py               <- NEW: PPO training script
+  pps_rl_models/                <- CREATED AT RUNTIME: saved models
+    pps_ppo_best.zip
+    pps_ppo_final.zip
+    checkpoints/
+      pps_ppo_ep10.zip
+      pps_ppo_ep20.zip
+      ...
+  pps_rl_logs/                  <- CREATED AT RUNTIME: TensorBoard logs
+    pps_ppo_<timestamp>/
+  pps_rl_metrics/               <- CREATED AT RUNTIME: CSV metrics
+    metrics_pps_ppo_<timestamp>.csv
+  change logs/
+    PPS_RL_implementation_changelog.txt  <- THIS FILE
+
+================================================================================
+END OF CHANGE LOG
+================================================================================

@@ -1,0 +1,152 @@
+================================================================================
+CHANGE LOG: PPS RL Bug Fixes & Improvements
+Date: 2026-04-08
+Author: Claude (AI Assistant)
+================================================================================
+
+OVERVIEW
+--------
+This change log documents bug fixes and improvements made to the PPS RL system
+after initial implementation. Changes include fixing persistent IndexError crashes,
+instance-level state isolation, TensorBoard reorganization, and per-episode order
+randomization.
+
+================================================================================
+
+CHANGE 1: Bounds Checking in Landscape Grid
+--------------------------------------------------------------------------------
+File    : engine/landscape.py
+Type    : Bug Fix
+Problem : IndexError: list index out of range
+          Robots occasionally moved to positions outside the grid boundary
+          (0 to dimension=60), causing _map[round(x)][round(y)] to throw
+          IndexError when x or y exceeded 60.
+
+Changes :
+  - Added _clamp(x, y) method that clamps any coordinate to [0, dimension]
+    using max(0, min(self.dimension, round(x)))
+  - Applied clamping in _setObjectNew() when appending to _map
+  - Applied clamping in setObject() for both old and new positions
+  - Applied clamping in get_neighbor_object()
+  - Fixed getNeighborObject() to skip points outside [0, dimension] bounds
+    instead of blindly accessing _map at out-of-range indices
+
+================================================================================
+
+CHANGE 2: Instance-Level State in Inventory
+--------------------------------------------------------------------------------
+File    : model/inventory.py
+Type    : Bug Fix
+Problem : Class-level mutable variables (map, movement_channel, stop_and_go,
+          total_energy, total_pod, total_turning, total_robot_idle, graph,
+          graph_pod) were shared across all Inventory instances. When PPSEnv
+          creates a new Inventory each episode, the previous episode's state
+          leaked into the new instance.
+
+Changes :
+  - Moved the following from class-level to instance-level in __init__():
+      self.map = []
+      self.movement_channel = {}
+      self.stop_and_go = 0
+      self.total_energy = 0
+      self.total_pod = 0
+      self.total_turning = 0
+      self.total_robot_idle = 0
+      self.graph = None
+      self.graph_pod = None
+
+================================================================================
+
+CHANGE 3: Instance-Level route_stop_points in Robot
+--------------------------------------------------------------------------------
+File    : model/robot.py
+Type    : Bug Fix
+Problem : route_stop_points = [] was a class-level attribute, meaning all Robot
+          instances shared the same list. When one robot modified its route, it
+          could affect other robots' route planning across simulation resets.
+
+Changes :
+  - Added self.route_stop_points = [] in Robot.__init__() so each robot
+    instance gets its own independent route list.
+
+================================================================================
+
+CHANGE 4: NoneType AttributeError in get_advanced_table_only
+--------------------------------------------------------------------------------
+File    : model/inventory.py  (line ~1193)
+Type    : Bug Fix
+Problem : AttributeError: 'NoneType' object has no attribute 'orders'
+          In get_advanced_table_only(), the code accessed first_queue.job.orders
+          but first_queue.job can be None (jobs are cleared after completion in
+          tick() via o.job = None). The guard `if first_queue` only checked
+          whether the robot object was None, not whether its job was None.
+
+Changes :
+  - Changed all three occupied slot expressions:
+      Before: first_queue.job.orders if first_queue else None
+      After:  first_queue.job.orders if (first_queue and first_queue.job) else None
+  - Same fix applied to second_queue and third_queue
+  - Fix was applied to both get_advanced_table_only() and get_advanced_table()
+    (two occurrences replaced)
+
+================================================================================
+
+CHANGE 5: TensorBoard Reorganization
+--------------------------------------------------------------------------------
+File    : train_pps_rl.py
+Type    : Improvement
+Problem : (1) TensorBoard was split into two folders per run — one from the
+          manual SummaryWriter and one auto-created by SB3's model.learn(),
+          suffixed with _0. (2) All 9 metrics were under one flat section.
+          (3) Three metrics (episode_time_sec, pile_on_items, pile_on_visits)
+          were low-value and cluttered the dashboard.
+
+Changes :
+  - Set tensorboard_log=None in both PPO() constructor calls (per_episode and
+    standard training functions) to disable SB3's internal TensorBoard writer.
+  - Removed tb_log_name from model.learn() call.
+  - Result: only one folder per run, written by the manual SummaryWriter.
+  - Removed three metrics: episode_time_sec, pile_on_items, pile_on_visits.
+  - Reorganized remaining 6 metrics into two TensorBoard sections:
+      pps_reward/   -> total_reward, pile_on_rate, avg_order_completion_time
+      pps_metrics/  -> throughput, cumulative_path_cost, episode_steps
+
+================================================================================
+
+CHANGE 6: Per-Episode Order Randomization
+--------------------------------------------------------------------------------
+File    : pps_env.py
+Type    : Improvement
+Problem : generated_order.csv was never regenerated between episodes, so the
+          agent always saw the exact same demand pattern. This causes the agent
+          to memorize one fixed scenario rather than learn a generalizable policy.
+
+Changes :
+  - Added order regeneration at the start of _create_warehouse() before
+    draw_layout() is called.
+  - Deletes generated_order.csv, generated_database_order.csv, and
+    generated_backlog.csv at the start of each episode.
+  - Calls config_orders() twice (matching netlogo.py draw_layout_from_generated_file):
+      1. sim_ver=1: generates main wave orders
+         (500 orders/hour, 9 hours, ABC class config A:0.5 B:0.3 C:0.2)
+      2. sim_ver=2: generates backlog orders and merges into generated_order.csv
+         (300 orders/hour, 9 hours, same ABC class config)
+  - Order randomness comes from numpy random inside gen_order():
+      - Arrival times: Poisson distribution
+      - Items per order: geometric distribution (p=0.5)
+      - SKU selection: weighted by item_order_frequency within ABC class
+      - Quantity per SKU: normal distribution, 1-12, even numbers favored
+  - Pod layout (generated_pod.csv) is NOT deleted — warehouse structure stays
+    fixed while demand varies each episode.
+
+================================================================================
+
+SUMMARY OF FILES CHANGED
+-------------------------
+  engine/landscape.py     - Bounds clamping in all _map access methods
+  model/inventory.py      - Instance-level mutable state + job None guard fix
+  model/robot.py          - Instance-level route_stop_points
+  train_pps_rl.py         - TensorBoard single folder + 2-section reorganization
+  pps_env.py              - Per-episode order randomization via config_orders()
+
+================================================================================

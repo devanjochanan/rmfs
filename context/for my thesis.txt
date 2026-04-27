@@ -1,0 +1,118 @@
+Rika Bab 4
+4.1 Experimental Result (design for experiment)
+Parameter yg diubah:
+-POA: pod-match, future-aware
+-PPS: demand PPS, station match PPS
+
+pod-match itu pertimbangin current pods yg lg dateng aja dan ga ngitung future statenya
+demand pps itu dia ngeliat demand semua station secara global (ini aneh sih)
+
+metrics diukur: (and % improvementnya)
+-throughput
+-order completion time
+-pile-on
+
+4.2 Statistical Analysis
+4.2.1 Normality test
+jadi dari data yg udah dikumpul ttg 3 metrics itu, dicari p valuenya
+kalo p valuenya diatas 5 artinya Normality
+
+4.2.2 homogenity of vairance test
+Levene's test -> untuk mastiin variancenya equal
+
+4.2.3 two way ANOVA analysis of throughput
+to determine how significant the improvement is within the POA method and the PPS method
+tukey honestly significant different analysis
+
+4.2.4 Non parametric analysis of order completion time
+kruskal wallis -> significancy difference of all scenarios for OCT
+mann-withney -> evaluate main effects of proposed strategy
+Mann–Whitney U test with Bonferroni correction -> pairwise post hoc comparisons of all scenarios
+
+4.2.5 Non parametric analysis of pile on
+
+4.3 sensitivity analysis
+parameter:
+-number of robots
+-number of pods
+-number of picking stations
+
+metrics:
+-throughput
+-order completion time
+-pile-on
+
+4.3.1 effect of num robots
+4.3.2 effect of num pods
+4.3.3 effect of num picking stations
+
+Hazdi Bab 4
+4.1 Simulation parameter
+intinya ngasitau semua parameternya:
+-simulation:
+run length
+iteration
+-layout:
+inventory area
+inv capacity
+charging port
+-items:
+sku on podsku variations
+order:
+total
+sku freq
+interarrival times
+-AMR movements:
+robot acc
+robot max velocity
+full training time
+store pod time
+robots in the syste,
+-replenishment stations:
+-picking station:
+
+4.2 result and analysis
+4.2.1 baseline scenario result
+metric:
+-total energy consumed
+-total waiting time at intersection
+
+4.2.2 RL integrated scenario results
+metric:
+-total energy consumed
+-total waiting time at intersection
+
+and 3 scenarios
+
+4.2.3 training iterations
+-iteration 1 (0-12.000 steps)
+-iteration 2 (12.001-24.000 steps)
+-iteration 3 (24.001-36.000 steps)
+
+4.3 statistical analysis
+4.3.1 normality test 
+-histogram
+-q-q plots
+-shapiro wilk
+
+4.3.2 non-parametic tests
+-The Wilcoxon Signed-Rank Test
+
+Emily Bab 4
+4.1 simulation result comparisons
+10 kali simulasi
+metric:
+-throughput efficiency
+-pile-on
+-pod-station visit
+bikin graph comparison baseline vs proposed method
+itung improvement per metrics
+
+4.2 sensitivity analysis
+parameter:
+-order arrival rate
+-threshold of difference in number of processing (ini cuman di Jhen)
+-number of picking stations
+-number of robots
+
+

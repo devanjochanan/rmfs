@@ -1,0 +1,21 @@
+PPS RL
+WINDOW 1 (Tensorboard)
+python -m tensorboard.main --logdir "C:\Users\Devan\Documents\RMFS Simulation\Fresh Start Main RMFS backup\saved_models\runs"
+
+WINDOW 2A (Start train)
+cd "C:\Users\Devan\Documents\RMFS Simulation\Fresh Start Main RMFS backup"
+python train_pps_rl.py --episodes 500 --save-path saved_models/pps_rl.pt --max-ticks 3000
+
+WINDOW 2B (Continue train)
+python train_pps_rl.py --resume --episodes 5000 --save-path saved_models/pps_rl.pt --max-ticks 3000
+
+
+JOINT
+WINDOW 1 (Tensorboard)
+python -m tensorboard.main --logdir "C:\Users\Devan\Documents\RMFS Simulation\Fresh Start Main RMFS backup\saved_models\joint_runs"
+
+WINDOW 2A (Start train)
+python train_joint_rl.py --episodes 500 --max-ticks 3000
+
+WINDOW 2B (Continue train)
+python train_joint_rl.py --resume --episodes 10000 --max-ticks 3000
