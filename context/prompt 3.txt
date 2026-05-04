@@ -1,0 +1,4 @@
+okay i want you to:
+1. remove action mask as an input to the PPS RL
+2. for the reward, i want you to make it total picked quantity (picked_qty = sum(qty for _, _, qty in job.orders))
+3. disable len(job.orders) first as an input, and instead of that add sum(qty for _, _, qty in job.orders) as an input to the PPS RL

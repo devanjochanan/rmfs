@@ -1,0 +1,207 @@
+Markov Decision Process
+The PPS RL is formally a Semi-MDP (technically a POMDP — explained at the end). Let me lay out each piece of the tuple (S, A, P, R, γ, ρ₀).
+
+S — State space
+What the agent observes at each decision point. From pps_env.py:106-124:
+s ∈ R^(60×56)  ⊕  R^(3×50)  ⊕  {0,1}^(60×4)  ⊕  N
+   │            │              │                │
+   pod_features │              action_mask     num_candidates
+                station_features
+pod_features[60, 56] — for up to 60 idle candidate pods: top-50 SKU qty + 3 distances + 3 match-degrees
+station_features[3, 50] — future-state SKU demand per station (= current − incoming-pod commits)
+action_mask[60, 4] — which actions are legal per pod
+num_candidates — how many of the 60 rows are real (rest are zero-padded)
+This is a fixed-shape state — the policy network's input dimensionality is constant even though the real number of pods/orders fluctuates. Padding + masking handles variable scale.
+
+A — Action space
+From pps_env.py:125:
+A = {0, 1, 2, 3}^60      (MultiDiscrete([4]*60))
+One categorical decision per pod row.
+0 = leave pod idle
+k ∈ {1,2,3} = send pod to picker-k
+Joint action size is technically 4^60 ≈ 1.3 × 10^36, but parameter-sharing across pod rows means the policy only has to learn a per-pod scoring function, not the full joint table.
+
+P(s' | s, a) — Transition dynamics
+This is where it stops being a regular MDP and becomes a Semi-MDP. One agent step doesn't correspond to one simulation tick. From pps_env.py:510-543:
+1. Apply action a to warehouse (commit pods to stations, build RobotJobs).
+2. Run simulation ticks one-at-a-time until any of:
+     (a) all orders finished      → terminal
+     (b) tick >= max_episode_ticks → terminal (truncated)
+     (c) some station has unmet demand AND idle pods with matching SKUs
+         → next decision point reached
+3. Return new observation s'.
+Between consecutive agent decisions, an unspecified number of ticks elapse (anywhere from 1 to ~200). During those ticks:
+New orders arrive (find_new_orders)
+POA fires whenever a station has a free bin and unassigned orders exist (Rika's future-aware xxx())
+Robots dispatch to jobs in job_queue, move to pods, carry pods to stations
+finish_picking_task fires on arrival → orders' delivered qty incremented; if order complete → removed from station; pod returns to idle
+
+P is stochastic because:
+Order arrivals follow the generated stream
+Robot routing has slight non-determinism in tie-breaks
+POA depends on the evolving state (so its behavior changes based on prior PPS decisions)
+The agent never sees raw P — it only experiences sampled trajectories.
+
+R(s, a, s') — Reward
+From pps_env.py:582-619:
+r = pile_on_rate_delta − α · avg_oct_delta
+Where, between two consecutive decision points:
+pile_on_rate_delta  =  Δ(items picked across new visits) / Δ(visits)
+avg_oct_delta       =  Δ(total completion time) / Δ(orders completed)
+α                   =  ALPHA_OCT = 0.001
+
+Properties:
+Dense: every agent step gets a meaningful scalar (not just terminal).
+Differential / shaped: each r_t reflects what changed during the gap between decision t and t+1.
+Sum-telescoping: Σ r_t ≈ final_pile_on − α × final_avg_oct, so undiscounted episode reward tracks the KPIs you actually care about.
+γ — Discount factor
+γ = 0.99       (PPO default)
+Multiplies future rewards: a reward 100 decisions away is worth 0.99^100 ≈ 0.37 now. Used inside GAE/value-function estimation, not in the env itself.
+
+ρ₀ — Initial state distribution
+From pps_env.py:140-172 (reset):
+1. Build a fresh warehouse Inventory.
+2. Re-generate orders via config_orders(...) — random per episode.
+3. Reset all class-level singletons (Universe, Landscape).
+4. Lay out pods/stations via draw_layout.
+5. Run sim ticks until first PPS decision point.
+6. Return initial observation s_0.
+So ρ₀ is stochastic — every episode samples a new order stream and pod/SKU distribution. This gives the agent diverse experiences and prevents memorization of one specific schedule.
+
+Episode termination
+From pps_env.py:518-526:
+terminated = True   if all orders finished       (proper terminal)
+truncated  = True   if tick >= max_episode_ticks (cutoff)
+PPO treats truncated and terminated slightly differently for value bootstrapping (terminated → V(s_T) = 0 in the return target; truncated → V(s_T) is estimated by the critic).
+
+Putting it together — one transition
+
+current state s_t
+        │
+        ▼
+    π_θ(·|s_t)  →  sample a_t  (60 categorical heads)
+        │
+        ▼
+   PPSEnv.step(a_t)
+        │
+        ├── execute assignments (RobotJobs created, pods reserved)
+        │
+        ├── advance warehouse simulation:
+        │     ticks pass …
+        │     orders arrive
+        │     POA fires (Rika xxx, no batching)
+        │     robots execute jobs
+        │     orders complete
+        │
+        ├── compute r_t = pile_on_rate_delta − α · avg_oct_delta
+        │
+        └── build observation s_{t+1}
+        ▼
+        next state s_{t+1}
+Why this is technically a POMDP
+The observation is not a sufficient statistic for the full warehouse state:
+
+Hidden state: exact pod coordinates (only Manhattan distance is exposed), in-flight robot positions, pickup/delivery delays, replenishment queues, the order-arrival schedule beyond now.
+SKUs outside top-50: the state truncates rare SKUs to nothing, even though they affect rewards.
+Padded rows: pod features beyond num_candidates are zeroed but their indices may still be meaningful.
+So formally o_t ≠ s_t — the agent sees an observation derived from a hidden true state. That makes this a POMDP in name, treated as an MDP in practice (the assumption is that the chosen features are "good enough" approximations of the Markov state).
+
+
+Markov Decision Process VS PPO
+
+solution:
+
+What it is	Role
+MDP	a mathematical framework for describing a sequential decision problem	the problem statement
+PPO	an algorithm that learns a policy by interacting with the problem	one solution method
+An MDP says "here's the world." PPO says "here's how I'll learn to act in that world."
+
+What is an MDP?
+A Markov Decision Process is just five things:
+MDP = (S, A, P, R, γ)
+S — set of possible states
+A — set of possible actions
+P(s' | s, a) — transition function: probability of landing in s' if you do action a in state s
+R(s, a, s') — reward function
+γ — discount factor
+
+Plus the Markov property: the future depends only on the current state, not on how you got there.
+P(s_{t+1} | s_t, a_t, s_{t-1}, a_{t-1}, …)  =  P(s_{t+1} | s_t, a_t)
+That's the whole thing. No learning, no neural net, no algorithm — just a description.
+
+Tiny example
+Imagine a 3-state world:
+   states:  A  B  C
+   actions: left, right
+   from A: right → B (reward 0)
+   from B: right → C (reward +10), left → A (reward 0)
+   from C: terminal
+This is an MDP. There's no "agent" yet, no learning. It's just the rules of the world.
+
+What does PPO do with the MDP?
+Given an MDP, the goal is to find a policy π(a|s) that maximizes:
+J(π) = E_π [ Σ γ^t · R(s_t, a_t, s_{t+1}) ]
+        ─────  ──────────────────────────
+        expected      discounted total reward
+        over           from following π
+        trajectories
+The "answer" to the MDP is the policy. PPO is one way to find that policy.
+
+PPO works by:
+
+Letting the current policy interact with the MDP for a while
+Looking at the rewards collected
+Adjusting the policy parameters θ toward actions that gave higher reward
+Doing so without changing θ too aggressively (the clip trick)
+There are many other algorithms that try to solve the same MDP:
+
+Value iteration / policy iteration — works only if P and R are known and S is small
+Q-learning / DQN — learns the action-value function instead of a policy directly
+REINFORCE — vanilla policy gradient (no clipping)
+TRPO — PPO's predecessor with formal trust-region math
+A3C, SAC, DDPG, …
+All of them assume the world is described by an MDP. They differ in how they search for the policy.
+
+So… are they different?
+Yes — but they live in different layers:
+
+
+Layer 1: Problem statement
+─────────────────────────────────────────────
+   MDP: defines (S, A, P, R, γ)
+   "Here's what the world looks like.
+    Here's what an agent can do.
+    Here's how rewards are given."
+
+Layer 2: Algorithm
+─────────────────────────────────────────────
+   PPO: learns θ for π_θ(a|s) by repeatedly
+        - sampling trajectories from the MDP
+        - estimating advantages with GAE
+        - updating θ via clipped surrogate loss
+
+Layer 3: Implementation
+─────────────────────────────────────────────
+   Stable-Baselines3 + PPSEnv (your code)
+You can solve the same MDP with PPO, DQN, or SAC. You can apply PPO to many different MDPs (Atari, robotic control, your warehouse). The MDP and the algorithm are independent choices.
+
+Why does PPO need the MDP framing?
+Because PPO's math relies on the Markov property:
+
+The value function V(s) exists only because s summarizes all you need to predict the future. If state weren't Markov, V(s) wouldn't be well-defined.
+GAE assumes that delta_t = r_t + γ V(s_{t+1}) - V(s_t) is meaningful — which requires that s_{t+1} is a sufficient statistic for the future from there onward.
+Same for the policy gradient: ∇ J = E[A_t · ∇ log π(a_t|s_t)] is only correct under MDP assumptions.
+So PPO's correctness rests on the world being (approximately) an MDP. If your env is wildly non-Markov, PPO can still work, but with no theoretical guarantees.
+
+In your warehouse
+
+The MDP
+   S  = (pod features, station features, action mask, num candidates)
+   A  = MultiDiscrete([4]*60)
+   P  = "advance simulation ticks until next PPS point"
+   R  = pile_on_rate_delta − α · avg_oct_delta
+   γ  = 0.99
+
+The algorithm
+   PPO (with MultiInputPolicy network, GAE advantages, clipped objective)
+The MDP is what your PPSEnv exposes. PPO is what train_pps_rl.py runs against it. You could swap PPO out for DQN tomorrow without touching PPSEnv — that's the value of the

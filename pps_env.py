@@ -17,7 +17,7 @@ Observation:
         - Future-state SKU demand = current SKU demand - incoming pods' SKUs
           that will be picked at that station
 Reward:
-    pile_on  -  alpha * avg_order_completion_time
+    picked quantity - pod visit penalty - average completion time penalty
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ NUM_STATIONS = 3           # picker-0, picker-1, picker-2
 NUM_ACTIONS = NUM_STATIONS + 1   # 0=unassigned, 1..3=station
 TOP_K_SKUS = 50           # dimensionality of SKU feature vector per pod
 ALPHA_OCT = 0.001          # weight for order-completion-time penalty in reward
+POD_VISIT_PENALTY = 1.0    # per successful pod-station visit in reward
 MAX_PODS_OBS = 60          # max pods we observe at once (padded if fewer)
 
 
@@ -95,12 +96,14 @@ class PPSEnv(gym.Env):
         max_episode_ticks: int = 32400,   # 9 hours * 3600 / 0.25
         use_heuristic_fallback: bool = True,
         reward_alpha: float = ALPHA_OCT,
+        reward_visit_penalty: float = POD_VISIT_PENALTY,
     ):
         super().__init__()
 
         self.max_episode_ticks = max_episode_ticks
         self.use_heuristic_fallback = use_heuristic_fallback
         self.reward_alpha = reward_alpha
+        self.reward_visit_penalty = reward_visit_penalty
 
         # ---- spaces (will be refined in reset once we know pod count) ----
         self.max_pods = MAX_PODS_OBS
@@ -120,11 +123,6 @@ class PPSEnv(gym.Env):
             "num_candidates": spaces.Box(
                 low=0, high=self.max_pods, shape=(1,), dtype=np.int32,
             ),
-            "action_mask": spaces.Box(
-                low=0, high=1,
-                shape=(self.max_pods, NUM_ACTIONS),
-                dtype=np.int8,
-            ),
         })
         # Each pod picks one of 4 actions
         self.action_space = spaces.MultiDiscrete([NUM_ACTIONS] * self.max_pods)
@@ -141,6 +139,9 @@ class PPSEnv(gym.Env):
         self._prev_pile_on_items: int = 0
         self._prev_pile_on_visits: int = 0
         self._prev_completion_time: float = 0.0
+        self._last_reward_picked_qty: float = 0.0
+        self._last_reward_pod_visits: float = 0.0
+        self._last_reward_avg_completion_time: float = 0.0
         self._step_count: int = 0
 
     # ------------------------------------------------------------------
@@ -171,6 +172,9 @@ class PPSEnv(gym.Env):
             self._prev_pile_on_items = 0
             self._prev_pile_on_visits = 0
             self._prev_completion_time = 0.0
+            self._last_reward_picked_qty = 0.0
+            self._last_reward_pod_visits = 0.0
+            self._last_reward_avg_completion_time = 0.0
             self._step_count = 0
 
             # Advance simulation until first PPS decision point
@@ -441,7 +445,6 @@ class PPSEnv(gym.Env):
 
         n = len(candidates)
         features = np.zeros((self.max_pods, self.pod_feature_dim), dtype=np.float32)
-        mask = np.zeros((self.max_pods, NUM_ACTIONS), dtype=np.int8)
         station_feats = np.zeros((NUM_STATIONS, TOP_K_SKUS), dtype=np.float32)
 
         for j, sid in enumerate(station_ids[:NUM_STATIONS]):
@@ -482,24 +485,10 @@ class PPSEnv(gym.Env):
                     min(matched / max(total_demand, 1), 1.0)
                 )
 
-            # Action mask: action 0 always valid, station actions valid if station has orders
-            mask[i, 0] = 1  # unassigned always valid
-            for j, sid in enumerate(station_ids):
-                station = self._warehouse.station_manager.get_station_by_id(sid)
-                if len(station.incoming_pod) < station.max_robots:
-                    mask[i, j + 1] = 1
-                else:
-                    mask[i, j + 1] = 0
-
-        # Pad remaining with action 0 only
-        for i in range(n, self.max_pods):
-            mask[i, 0] = 1
-
         return {
             "pod_features": features,
             "station_features": station_feats,
             "num_candidates": np.array([n], dtype=np.int32),
-            "action_mask": mask,
         }
 
     # ------------------------------------------------------------------
@@ -570,8 +559,9 @@ class PPSEnv(gym.Env):
                         pod_assigned_time=self._warehouse._tick,
                         status="queue",
                     )
-                # Track pile-on
-                self._episode_pile_on_items += len(job.orders)
+                # Track actual picked quantity, not number of order-SKU triplets.
+                picked_qty = sum(qty for _, _, qty in job.orders)
+                self._episode_pile_on_items += picked_qty
                 self._episode_pile_on_visits += 1
 
     # ------------------------------------------------------------------
@@ -651,23 +641,16 @@ class PPSEnv(gym.Env):
 
     def _compute_reward(self) -> float:
         """
-        Reward = delta_pile_on - alpha * delta_avg_order_completion_time
-
-        Where delta = change since last step.
+        Reward = picked_qty_delta - visit_penalty * pod_visits_delta
+                 - alpha * avg_completion_time_delta.
         """
-        # Pile-on delta
-        pile_on_delta = (
+        picked_qty_delta = (
             self._episode_pile_on_items - self._prev_pile_on_items
         )
-        pile_on_visits_delta = (
+        pod_visits_delta = (
             self._episode_pile_on_visits - self._prev_pile_on_visits
         )
-        if pile_on_visits_delta > 0:
-            pile_on_rate = pile_on_delta / pile_on_visits_delta
-        else:
-            pile_on_rate = 0.0
 
-        # Avg completion time delta
         new_completed = (
             self._episode_orders_completed - self._prev_orders_completed
         )
@@ -675,9 +658,13 @@ class PPSEnv(gym.Env):
             self._episode_total_completion_time - self._prev_completion_time
         )
         if new_completed > 0:
-            avg_ct = ct_delta / new_completed
+            avg_ct_delta = ct_delta / new_completed
         else:
-            avg_ct = 0.0
+            avg_ct_delta = 0.0
+
+        self._last_reward_picked_qty = float(picked_qty_delta)
+        self._last_reward_pod_visits = float(pod_visits_delta)
+        self._last_reward_avg_completion_time = float(avg_ct_delta)
 
         # Update prev
         self._prev_orders_completed = self._episode_orders_completed
@@ -685,7 +672,11 @@ class PPSEnv(gym.Env):
         self._prev_pile_on_visits = self._episode_pile_on_visits
         self._prev_completion_time = self._episode_total_completion_time
 
-        reward = pile_on_rate - self.reward_alpha * avg_ct
+        reward = (
+            picked_qty_delta
+            - self.reward_visit_penalty * pod_visits_delta
+            - self.reward_alpha * avg_ct_delta
+        )
         return float(reward)
 
     def _build_info(self) -> Dict[str, Any]:
@@ -701,7 +692,13 @@ class PPSEnv(gym.Env):
             "avg_order_completion_time": avg_ct,
             "pile_on_rate": pile_on,
             "pile_on_items": self._episode_pile_on_items,
+            "picked_quantity": self._episode_pile_on_items,
             "pile_on_visits": self._episode_pile_on_visits,
+            "reward_picked_qty_delta": self._last_reward_picked_qty,
+            "reward_pod_visits_delta": self._last_reward_pod_visits,
+            "reward_avg_completion_time_delta": (
+                self._last_reward_avg_completion_time
+            ),
             "cumulative_path_cost": self._episode_cumulative_path_cost,
             "throughput": self._episode_orders_completed,
             "tick": self._warehouse._tick if self._warehouse else 0,

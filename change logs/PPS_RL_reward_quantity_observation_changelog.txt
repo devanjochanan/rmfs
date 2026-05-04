@@ -1,0 +1,125 @@
+================================================================================
+CHANGE LOG: PPS RL Reward Quantity and Observation Update
+Date: 2026-05-04
+Author: Codex
+================================================================================
+
+OVERVIEW
+--------
+This change updates the PPS-only reinforcement learning environment so the PPO
+observation no longer includes action_mask, and the reward is based on actual
+picked quantity instead of the number of order-SKU task rows.
+
+================================================================================
+FILE CHANGES
+================================================================================
+
+--------------------------------------------------------------------------------
+1. pps_env.py
+--------------------------------------------------------------------------------
+
+CHANGE A: Removed action_mask from the PPO observation.
+
+Approximate locations:
+  - observation_space definition near lines 109-123
+  - _build_observation() near lines 435-499
+
+Before:
+  - observation_space included:
+        "action_mask": Box(shape=(60, 4), dtype=int8)
+  - _build_observation() created a mask array and returned it in the observation.
+
+After:
+  - observation_space returns only:
+        "pod_features"
+        "station_features"
+        "num_candidates"
+  - _build_observation() no longer builds or returns action_mask.
+
+Reason:
+  Standard Stable-Baselines3 PPO does not enforce action masks automatically.
+  Keeping action_mask as a normal input could make the policy observe legality
+  information without preventing invalid actions. This change removes it from
+  the PPS RL input entirely.
+
+CHANGE B: Replaced len(job.orders) accounting with actual picked quantity.
+
+Approximate location:
+  - _execute_assignments() near lines 541-556
+
+Before:
+  - self._episode_pile_on_items += len(job.orders)
+  - This counted the number of order-SKU triplets in a job.
+
+After:
+  - picked_qty = sum(qty for _, _, qty in job.orders)
+  - self._episode_pile_on_items += picked_qty
+  - This counts the actual item quantity assigned to the pod-station job.
+
+Reason:
+  A job like [(order_1, sku_a, 10), (order_2, sku_b, 2)] should contribute
+  12 picked units, not 2 task rows.
+
+CHANGE C: Changed reward to picked quantity delta.
+
+Approximate location:
+  - _compute_reward() near lines 632-647
+
+Before:
+  - reward = pile_on_rate_delta - reward_alpha * avg_completion_time_delta
+
+After:
+  - reward = picked_qty_delta
+  - picked_qty_delta is the increase in accumulated picked quantity since the
+    previous PPS decision.
+
+Reason:
+  The user requested total picked quantity as the PPS RL reward signal. The
+  implementation uses the per-step delta so episode reward sums to total picked
+  quantity without repeatedly double-counting cumulative totals.
+
+CHANGE D: Added picked_quantity to info.
+
+Approximate location:
+  - _build_info() near lines 653-665
+
+After:
+  - info now includes:
+        "picked_quantity": self._episode_pile_on_items
+
+Reason:
+  This exposes the actual picked quantity used by the new reward for logging
+  and analysis while keeping the older "pile_on_items" key for compatibility.
+
+--------------------------------------------------------------------------------
+2. train_pps_rl.py
+--------------------------------------------------------------------------------
+
+CHANGE: Added picked_quantity to the per-episode CSV metrics.
+
+Approximate locations:
+  - MetricsRecorder.HEADER near lines 58-67
+  - MetricsRecorder.record() near lines 75-86
+
+Before:
+  - CSV recorded pile_on_items only.
+
+After:
+  - CSV records both pile_on_items and picked_quantity.
+  - picked_quantity falls back to pile_on_items if an older env does not provide
+    the new key.
+
+Reason:
+  The new reward source is now directly visible in the saved metrics file.
+
+================================================================================
+NOTES
+================================================================================
+
+Because the observation space changed, models trained before this update are not
+compatible with the new PPSEnv observation dictionary. Start a fresh PPS PPO run
+instead of resuming an older checkpoint.
+
+================================================================================
+END OF CHANGE LOG
+================================================================================

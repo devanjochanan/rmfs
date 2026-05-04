@@ -1,0 +1,138 @@
+================================================================================
+CHANGE LOG: PPS RL Hybrid Reward Update
+Date: 2026-05-04
+Author: Codex
+================================================================================
+
+OVERVIEW
+--------
+This change updates the PPS-only RL reward from pure picked quantity to a hybrid
+reward that also penalizes pod visits and average order completion time.
+
+New reward:
+  reward =
+      picked_qty_delta
+      - visit_penalty * pod_visits_delta
+      - reward_alpha * avg_completion_time_delta
+
+Default weights:
+  visit_penalty = 1.0
+  reward_alpha  = 0.001
+
+================================================================================
+FILE CHANGES
+================================================================================
+
+--------------------------------------------------------------------------------
+1. pps_env.py
+--------------------------------------------------------------------------------
+
+CHANGE A: Added POD_VISIT_PENALTY constant.
+
+Approximate location:
+  - constants near the top of the file
+
+After:
+  - POD_VISIT_PENALTY = 1.0
+
+Reason:
+  Penalizes each successful pod-station job so PPO does not maximize picked
+  quantity by sending too many pods.
+
+CHANGE B: Added reward_visit_penalty to PPSEnv.__init__().
+
+Approximate location:
+  - PPSEnv.__init__()
+
+After:
+  - reward_visit_penalty defaults to POD_VISIT_PENALTY
+  - self.reward_visit_penalty stores the configured value
+
+Reason:
+  Lets training tune the pod visit penalty without editing the environment file.
+
+CHANGE C: Updated _compute_reward().
+
+Approximate location:
+  - _compute_reward()
+
+Before:
+  - reward = picked_qty_delta
+
+After:
+  - reward = picked_qty_delta
+             - reward_visit_penalty * pod_visits_delta
+             - reward_alpha * avg_completion_time_delta
+
+Reward components:
+  - picked_qty_delta: actual picked quantity assigned since previous PPS step
+  - pod_visits_delta: number of successful pod-station jobs since previous step
+  - avg_completion_time_delta: average completion time among newly completed
+    orders since previous step, or 0 if no orders completed
+
+Reason:
+  Keeps the reward dense and action-related while discouraging excessive pod
+  visits and restoring pressure against slow order completion.
+
+CHANGE D: Added reward component fields to info.
+
+Approximate location:
+  - _build_info()
+
+New info keys:
+  - reward_picked_qty_delta
+  - reward_pod_visits_delta
+  - reward_avg_completion_time_delta
+
+Reason:
+  Makes reward debugging easier when checking logs and training behavior.
+
+--------------------------------------------------------------------------------
+2. train_pps_rl.py
+--------------------------------------------------------------------------------
+
+CHANGE A: Added reward components to CSV metrics.
+
+Approximate locations:
+  - MetricsRecorder.HEADER
+  - MetricsRecorder.record()
+
+New CSV columns:
+  - reward_picked_qty_delta
+  - reward_pod_visits_delta
+  - reward_avg_completion_time_delta
+
+CHANGE B: Added TensorBoard episode-level reward signals.
+
+Approximate location:
+  - PPSMetricsCallback._on_step()
+
+New TensorBoard scalars:
+  - pps_reward/picked_quantity
+  - pps_reward/pod_visits
+
+CHANGE C: Added training CLI reward controls.
+
+Approximate locations:
+  - train() signature and env construction
+  - argparse setup
+
+New CLI args:
+  - --reward-alpha
+  - --visit-penalty
+
+Example:
+  python train_pps_rl.py --episodes 500 --visit-penalty 1.0 --reward-alpha 0.001
+
+================================================================================
+NOTES
+================================================================================
+
+Because reward behavior changed, compare new runs against previous runs as a new
+experiment. The observation space has not changed in this update, but the earlier
+action_mask removal means older checkpoints from before that observation update
+remain incompatible.
+
+================================================================================
+END OF CHANGE LOG
+================================================================================

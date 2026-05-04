@@ -1,0 +1,189 @@
+================================================================
+PPS RL AGENT TRAINING - PSEUDOCODE
+================================================================
+Algorithm: Proximal Policy Optimization (PPO)
+Library:   Stable-Baselines3 (MultiInputPolicy)
+Env:       PPSEnv (Gymnasium)
+
+
+================================================================
+NOTATION
+================================================================
+N_STATIONS = 3
+TOP_K_SKUS = 50
+MAX_PODS   = 60
+NUM_ACTIONS = 4   (0 = unassigned, 1..3 = assign to picker k)
+
+pi_theta(a | s)  : policy network parameters theta
+V_phi(s)         : value (critic) network parameters phi
+gamma            : discount factor
+lambda           : GAE smoothing
+epsilon          : PPO clip range
+K_epochs         : SGD epochs per rollout
+B                : minibatch size
+T                : rollout length (n_steps)
+
+
+================================================================
+INPUTS / HYPERPARAMETERS
+================================================================
+total_episodes        : approximate number of episodes to train
+n_steps T             : rollout length per PPO update
+learning_rate         : initial LR (linearly decayed to lr_end)
+batch_size B
+n_epochs K_epochs
+gamma, gae_lambda
+clip_range epsilon
+ent_coef, vf_coef     : entropy bonus, value loss weight
+max_episode_ticks     : episode cutoff in simulation ticks
+n_envs                : number of parallel environments
+
+
+================================================================
+INITIALIZATION
+================================================================
+create vec_env  ←  vector of n_envs PPSEnv instances
+                   (DummyVecEnv if n_envs == 1, else SubprocVecEnv)
+
+if resuming:
+    load policy pi_theta, value V_phi, optimizer state from BEST_MODEL
+    restore episode_count, best_throughput, LR-decay plan
+else:
+    initialize pi_theta, V_phi randomly  (MultiInputPolicy MLP)
+    initialize linear LR schedule [learning_rate → lr_end]
+
+initialize rollout_buffer of capacity T x n_envs
+initialize TensorBoard writer, CSV recorder, tqdm progress bar
+
+
+================================================================
+MAIN TRAINING LOOP  (driven by SB3 model.learn)
+================================================================
+session_episodes ← 0
+obs ← vec_env.reset()         # build first observation per env
+
+WHILE session_episodes < total_episodes:
+
+    -------- 1. ROLLOUT COLLECTION (T steps) --------
+    FOR t = 1 .. T:
+        FOR each env i in 1..n_envs:
+            s_t       ← obs[i]                   # Dict observation
+            a_t, logp ← pi_theta.sample(s_t, action_mask = s_t.action_mask)
+            v_t       ← V_phi(s_t)
+            obs', r_t, done, info ← env_i.step(a_t)
+            rollout_buffer.add(s_t, a_t, r_t, v_t, logp, done)
+
+            IF done:
+                session_episodes ← session_episodes + 1
+                LOG_EPISODE(info, episode_reward, episode_steps)
+                IF info.throughput > best_throughput:
+                    best_throughput ← info.throughput
+                    SAVE pi_theta, V_phi → BEST_MODEL
+                IF session_episodes mod 10 == 0:
+                    SAVE pi_theta, V_phi → CHECKPOINT_ep{N}
+                obs[i] ← env_i.reset()
+            ELSE:
+                obs[i] ← obs'
+
+        IF session_episodes >= total_episodes: BREAK
+
+    -------- 2. ADVANTAGE ESTIMATION (GAE) --------
+    last_values ← V_phi(obs)
+    rollout_buffer.compute_returns_and_advantages(last_values, gamma, gae_lambda)
+    # advantages A_t = sum_{l=0..} (gamma * lambda)^l * delta_{t+l}
+    # returns    R_t = A_t + V_phi(s_t)
+    advantages ← (advantages - mean) / (std + 1e-8)    # normalize
+
+    -------- 3. POLICY + VALUE UPDATE (PPO) --------
+    FOR k = 1 .. K_epochs:
+        FOR each minibatch of size B from rollout_buffer:
+            ratio   ← exp( logp_new(a|s) - logp_old(a|s) )
+            L_clip  ← - mean( min(
+                          ratio * A,
+                          clip(ratio, 1 - epsilon, 1 + epsilon) * A
+                       ) )
+            L_value ← mean( (V_phi(s) - R)^2 )
+            L_ent   ← - mean( entropy(pi_theta(.|s)) )
+            L_total ← L_clip + vf_coef * L_value + ent_coef * L_ent
+
+            optimizer.zero_grad()
+            L_total.backward()
+            clip_grad_norm(theta, phi, max_grad_norm)
+            optimizer.step()
+
+    learning_rate ← lr_schedule(progress)        # linear decay
+    rollout_buffer.clear()
+
+END WHILE
+
+SAVE pi_theta, V_phi → FINAL_MODEL
+PERSIST {episode_count, best_throughput, run_name, LR plan} → train_state.json
+
+
+================================================================
+SUBROUTINE: env.step(a_t)   (PPSEnv internals)
+================================================================
+INPUT:  action vector a_t  in {0..3}^MAX_PODS
+
+# ---- 1. Execute pod-to-station assignments ----
+candidates ← idle pods whose SKUs match any station demand (up to MAX_PODS)
+FOR each pod i in candidates:
+    IF a_t[i] == 0: continue                 # leave idle
+    target_station ← station[a_t[i] - 1]
+    IF station full OR pod no longer idle: continue
+    aggregate station orders → sku_to_quantity, sku_to_order_map
+    job ← add_picking_task_after_pps(station, pod, ...)
+        # commits SKU qty on orders, deducts from pod, marks pod busy
+    IF job has at least one triplet:
+        job_queue.append(job)
+        update pile_on counters
+
+# ---- 2. Advance warehouse ticks until next PPS decision ----
+REPEAT (up to max_idle_ticks):
+    IF tick >= max_episode_ticks:        return obs, r, terminated=False, truncated=True
+    IF all orders finished:              return obs, r, terminated=True,  truncated=False
+    warehouse.tick()
+        # internally:
+        #   find_new_orders               (every whole second)
+        #   process_orders → POA xxx()   (Rika future-aware, no batching)
+        #   dispatch nearest idle robot to job_queue head
+        #   move robots, finish_picking_task on arrival
+    update episode metrics (orders_completed, completion_times, path_cost)
+    IF some station has unmet demand AND idle pod with matching SKUs:
+        BREAK                                   # next decision point reached
+
+# ---- 3. Compute reward ----
+pile_on_rate_delta  ← (pile_on_items - prev_items) / max(visits - prev_visits, 1)
+avg_oct_delta       ← (total_completion_time - prev_ct) / max(orders - prev_orders, 1)
+reward              ← pile_on_rate_delta - alpha * avg_oct_delta
+
+# ---- 4. Build new observation ----
+obs.pod_features[60, 56]:
+    [0:50]     pod SKU qty over Top-50 SKUs   (normalized /100)
+    [50:53]    Manhattan distance to each of 3 stations (normalized)
+    [53:56]    match degree pod x station
+obs.station_features[3, 50]:
+    future SKU demand per station = current demand - incoming pod commits
+obs.action_mask[60, 4]:
+    action 0 always 1; action k (k>=1) = 1 if station k has free incoming slot
+obs.num_candidates:  number of valid candidate pods this step
+
+RETURN obs, reward, terminated, truncated, info
+
+
+================================================================
+SUBROUTINE: LOG_EPISODE(info, ep_reward, ep_steps)
+================================================================
+TensorBoard:
+    pps_reward/total_reward
+    pps_reward/pile_on_rate
+    pps_reward/avg_order_completion_time
+    pps_metrics/throughput
+    pps_metrics/cumulative_path_cost
+    pps_metrics/episode_steps
+CSV:
+    [episode, timestamp, throughput, cumulative_path_cost,
+     pile_on_rate, pile_on_items, pile_on_visits,
+     avg_order_completion_time, total_reward, episode_steps, sim_ticks]
+tqdm:
+    one-line update with throughput, pile_on, avg_oct, reward, wall time

@@ -61,7 +61,9 @@ class MetricsRecorder:
     HEADER = [
         "episode", "timestamp",
         "throughput", "cumulative_path_cost",
-        "pile_on_rate", "pile_on_items", "pile_on_visits",
+        "pile_on_rate", "pile_on_items", "picked_quantity", "pile_on_visits",
+        "reward_picked_qty_delta", "reward_pod_visits_delta",
+        "reward_avg_completion_time_delta",
         "avg_order_completion_time",
         "total_reward", "episode_steps", "sim_ticks",
     ]
@@ -80,7 +82,11 @@ class MetricsRecorder:
             info.get("cumulative_path_cost", 0.0),
             info.get("pile_on_rate", 0.0),
             info.get("pile_on_items", 0),
+            info.get("picked_quantity", info.get("pile_on_items", 0)),
             info.get("pile_on_visits", 0),
+            info.get("reward_picked_qty_delta", 0.0),
+            info.get("reward_pod_visits_delta", 0.0),
+            info.get("reward_avg_completion_time_delta", 0.0),
             info.get("avg_order_completion_time", 0.0),
             total_reward,
             steps,
@@ -144,12 +150,16 @@ class PPSMetricsCallback(BaseCallback):
 
                 throughput = info.get("throughput", 0)
                 pile_on = info.get("pile_on_rate", 0.0)
+                picked_quantity = info.get("picked_quantity", info.get("pile_on_items", 0))
+                pod_visits = info.get("pile_on_visits", 0)
                 avg_oct = info.get("avg_order_completion_time", 0.0)
                 cpc = info.get("cumulative_path_cost", 0.0)
 
                 # TensorBoard
                 if self._tb_writer is not None:
                     self._tb_writer.add_scalar("pps_reward/total_reward", ep_reward, ep)
+                    self._tb_writer.add_scalar("pps_reward/picked_quantity", picked_quantity, ep)
+                    self._tb_writer.add_scalar("pps_reward/pod_visits", pod_visits, ep)
                     self._tb_writer.add_scalar("pps_reward/pile_on_rate", pile_on, ep)
                     self._tb_writer.add_scalar("pps_reward/avg_order_completion_time", avg_oct, ep)
                     self._tb_writer.add_scalar("pps_metrics/throughput", throughput, ep)
@@ -167,6 +177,7 @@ class PPSMetricsCallback(BaseCallback):
                     self._pbar.set_postfix({
                         "tp": throughput,
                         "po": f"{pile_on:.2f}",
+                        "vis": pod_visits,
                         "oct": f"{avg_oct:.0f}",
                         "rew": f"{ep_reward:.1f}",
                         "t": f"{ep_elapsed:.1f}s",
@@ -249,7 +260,13 @@ _WORKER_STATIC_FILES = [
 ]
 
 
-def make_worker_env(worker_id: int, base_dir: str, max_ticks: int):
+def make_worker_env(
+    worker_id: int,
+    base_dir: str,
+    max_ticks: int,
+    reward_alpha: float,
+    visit_penalty: float,
+):
     """Factory for SubprocVecEnv workers.
 
     Each worker:
@@ -282,7 +299,11 @@ def make_worker_env(worker_id: int, base_dir: str, max_ticks: int):
         import model.order_generator as og_mod
         og_mod.parent_directory = workdir
 
-        return PPSEnv(max_episode_ticks=max_ticks)
+        return PPSEnv(
+            max_episode_ticks=max_ticks,
+            reward_alpha=reward_alpha,
+            reward_visit_penalty=visit_penalty,
+        )
     return _init
 
 
@@ -304,6 +325,8 @@ def train(
     vf_coef: float = 0.5,
     max_grad_norm: float = 0.5,
     max_episode_ticks: int = 32400,
+    reward_alpha: float = 0.001,
+    visit_penalty: float = 1.0,
     n_steps: int = 4096,
     n_envs: int = 1,
 ):
@@ -330,6 +353,8 @@ def train(
         vf_coef: Value function loss coefficient.
         max_grad_norm: Gradient clipping norm.
         max_episode_ticks: Max simulation ticks per episode.
+        reward_alpha: Weight for average completion time penalty.
+        visit_penalty: Penalty per successful pod-station visit.
         n_steps: Steps per PPO rollout (set >= typical episode length).
     """
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -341,13 +366,25 @@ def train(
     if n_envs > 1:
         base_dir = os.getcwd()
         env_fns = [
-            make_worker_env(i, base_dir, max_episode_ticks)
+            make_worker_env(
+                i,
+                base_dir,
+                max_episode_ticks,
+                reward_alpha,
+                visit_penalty,
+            )
             for i in range(n_envs)
         ]
         vec_env = SubprocVecEnv(env_fns, start_method="spawn")
         print(f"Using SubprocVecEnv with {n_envs} parallel workers.")
     else:
-        vec_env = DummyVecEnv([make_pps_env(max_episode_ticks=max_episode_ticks)])
+        vec_env = DummyVecEnv([
+            make_pps_env(
+                max_episode_ticks=max_episode_ticks,
+                reward_alpha=reward_alpha,
+                reward_visit_penalty=visit_penalty,
+            )
+        ])
 
     # Load previous training state if resuming
     prev_episode_count = 0
@@ -388,6 +425,7 @@ def train(
     if resume and os.path.exists(BEST_MODEL + ".zip"):
         print(f"Resuming from {BEST_MODEL}")
         model = PPO.load(BEST_MODEL, env=vec_env, device="cpu")
+        model.tensorboard_log = os.path.join(LOG_DIR, run_name)
         # PPO.load restores lr_schedule (the linear decay fn) and optimizer state.
         current_progress = 1.0 - float(model.num_timesteps) / float(plan_total_timesteps)
         current_progress = max(0.0, min(1.0, current_progress))
@@ -426,7 +464,7 @@ def train(
             max_grad_norm=max_grad_norm,
             normalize_advantage=True,
             verbose=1,
-            tensorboard_log=None,
+            tensorboard_log=os.path.join(LOG_DIR, run_name),
             device="cpu",
         )
 
@@ -454,6 +492,8 @@ def train(
     print(f"  GAE lambda               : {gae_lambda}")
     print(f"  Clip range               : {clip_range}")
     print(f"  Entropy coef             : {ent_coef}")
+    print(f"  Reward OCT alpha         : {reward_alpha}")
+    print(f"  Reward visit penalty     : {visit_penalty}")
     print(f"  Max episode ticks        : {max_episode_ticks}")
     print(f"  TensorBoard              : python -m tensorboard.main --logdir \"{os.path.abspath(LOG_DIR)}\"")
     print(f"  CSV metrics              : {csv_path}")
@@ -486,6 +526,7 @@ def train(
             total_timesteps=learn_total_timesteps,
             callback=CallbackList([metrics_cb, stop_cb]),
             reset_num_timesteps=not resume,
+            tb_log_name="sb3",
         )
     finally:
         pbar.close()
@@ -588,6 +629,10 @@ if __name__ == "__main__":
                         help="Discount factor")
     parser.add_argument("--ent-coef", type=float, default=0.01,
                         help="Entropy coefficient")
+    parser.add_argument("--reward-alpha", type=float, default=0.001,
+                        help="Weight for average completion time penalty")
+    parser.add_argument("--visit-penalty", type=float, default=1.0,
+                        help="Penalty per successful pod-station visit")
     parser.add_argument("--save-path", type=str, default=None,
                         help="Override model save directory")
     parser.add_argument("--max-ticks", type=int, default=32400,
@@ -621,6 +666,8 @@ if __name__ == "__main__":
             n_epochs=args.epochs,
             gamma=args.gamma,
             ent_coef=args.ent_coef,
+            reward_alpha=args.reward_alpha,
+            visit_penalty=args.visit_penalty,
             max_episode_ticks=args.max_ticks,
             n_steps=args.n_steps,
             n_envs=args.n_envs,

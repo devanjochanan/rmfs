@@ -1,0 +1,227 @@
+1. The big picture
+You have an agent (the PPO policy). At each step it sees the world (s_t), picks an action (a_t), gets a reward (r_t), and the world transitions to a new state (s_{t+1}).
+
+
+s_0 -> a_0 -> r_0 -> s_1 -> a_1 -> r_1 -> s_2 -> ...
+In your code:
+
+s_t = the observation Dict (pod features, station features, action mask)
+a_t = the per-pod assignment vector
+r_t = pile_on_rate_delta - alpha * avg_oct_delta
+The agent's goal is to choose actions that maximize the total reward over an episode.
+
+2. Two networks: policy and value
+PPO maintains two neural nets:
+
+Policy network — pi_theta(a | s)
+Given a state s, it outputs a probability distribution over actions. Theta θ are its weights.
+
+Example: "given current pod & station state, the policy says: assign pod 0 to picker-2 with 70% probability, leave it idle with 20%, assign to picker-1 with 10%."
+
+We sample an action from this distribution at each step. Stochasticity = exploration.
+
+Value network — V_phi(s)
+Given a state s, predicts how much total future reward we expect if we keep playing from here. Phi φ are its weights.
+
+Example: "from this state, my future return will be about 12.5 reward units."
+
+The value net is a critic — it doesn't pick actions, it grades how good a state is.
+
+3. Return — G_t
+The "true" measure of how good a trajectory turned out:
+
+
+G_t  =  r_t  +  gamma * r_{t+1}  +  gamma^2 * r_{t+2}  +  ...
+It's the sum of all future rewards from time t onward, with future rewards multiplied by gamma (discount).
+
+What is gamma (γ)?
+gamma ∈ [0, 1], usually 0.99. It says: "how much do I value reward right now vs. reward 100 steps from now?"
+
+gamma = 0: greedy. Only care about the immediate reward.
+gamma = 1: care about all future rewards equally.
+gamma = 0.99: a reward 100 steps from now is worth 0.99^100 ≈ 0.37 of the same reward right now.
+Why discount? Two reasons:
+
+Mathematical: if episodes can be infinite, G_t would diverge without discounting.
+Practical: distant future is uncertain; near-term outcomes are more predictable.
+In your warehouse: a good pile-on right now is more reliably attributable to your action than something that happens 200 ticks later.
+
+4. Advantage — A_t
+The big question for the policy: "was this action better or worse than my average behavior in this state?"
+
+That's the advantage:
+
+
+A_t  =  G_t  -  V(s_t)
+G_t = what actually happened (the return from this trajectory).
+V(s_t) = what we expected to happen on average from this state.
+So A_t > 0 means "this action over-performed expectations — do more of this." A_t < 0 means "underperformed — do less of this."
+
+Why subtract V(s_t)?
+Without it, the policy gradient is super noisy. If G_t = 50 but the state was already good (V(s_t) = 48), the action only added +2. The pure return 50 would falsely tell us this action was great. Subtracting the baseline V isolates the contribution of the action, not the state.
+
+5. TD error — delta_t
+Computing G_t requires waiting until the end of the episode. We don't want to wait. Instead, use a one-step approximation:
+
+
+delta_t  =  r_t  +  gamma * V(s_{t+1})  -  V(s_t)
+Read it as: "I got r_t and I think the future from s_{t+1} is worth V(s_{t+1}). So my return estimate is r_t + gamma * V(s_{t+1}). The surprise vs. what I expected from s_t is the rest."
+
+delta_t is a one-step advantage estimate. It's low-bias-but-high-variance OR high-bias-but-low-variance depending on how good V is.
+
+6. GAE — the smart middle ground
+GAE = Generalized Advantage Estimation. It blends multiple n-step views to balance bias vs. variance:
+
+
+A_t  =  sum_{l=0..}  (gamma * lambda)^l  *  delta_{t+l}
+
+     =  delta_t  +  (gamma*lambda) * delta_{t+1}  +  (gamma*lambda)^2 * delta_{t+2}  +  ...
+What is lambda (λ)?
+lambda ∈ [0, 1], usually 0.95. It controls bias-variance:
+
+lambda = 0: A_t = delta_t (just the one-step TD error). Low variance, high bias — relies on V being accurate.
+lambda = 1: A_t = G_t - V(s_t) (full Monte Carlo). Low bias, high variance — uses the actual trajectory.
+lambda = 0.95: weighted blend. The default, works well for most tasks.
+So the line A_t = sum_{l=0..} (gamma*lambda)^l * delta_{t+l} in your pseudocode is just GAE.
+
+7. The policy gradient
+OK so we have A_t. How does the policy use it?
+
+Vanilla policy gradient says: "increase the probability of actions whose advantage was positive, decrease for negative." Mathematically:
+
+
+gradient of objective ≈  E[ A_t * grad log pi_theta(a_t | s_t) ]
+Translation: nudge θ so that pi_theta(a_t|s_t) goes up when A_t > 0, down when A_t < 0.
+
+The problem
+Naively doing this can destroy the policy in one bad update. If you take a giant gradient step and the new policy is wildly different from the data-collecting policy, the data is no longer valid for that new policy.
+
+8. PPO's fix: clipped surrogate objective
+PPO defines a ratio:
+
+
+ratio  =  pi_theta_new(a_t|s_t)  /  pi_theta_old(a_t|s_t)
+       =  exp( log pi_new  -  log pi_old )
+ratio = 1 means the new policy assigns the same probability as the old one. ratio = 2 means the new policy is twice as likely to take this action.
+
+The PPO objective:
+
+
+L_clip  =  - mean( min(
+              ratio * A_t,
+              clip(ratio, 1-epsilon, 1+epsilon) * A_t
+          ) )
+What this does intuitively:
+
+If A_t > 0 (action was good), we want to increase its probability — but only up to (1+epsilon) * A_t. Beyond that, the gradient is clipped → no further increase.
+If A_t < 0 (action was bad), we want to decrease its probability — but only down to (1-epsilon) * A_t. Beyond that, clipped.
+epsilon = 0.2 typically. So PPO says "improve, but don't change the policy by more than ±20% per update."
+
+This is the whole magic of PPO: a simple way to prevent destructive updates without expensive trust-region math (which TRPO did).
+
+9. The full loss
+
+L_total  =  L_clip  +  vf_coef * L_value  -  ent_coef * H(pi)
+Three pieces:
+
+L_clip — the policy improvement objective (above).
+L_value = mean( (V_phi(s) - R_t)^2 ) — train the value network to predict the actual returns. vf_coef = 0.5 typically.
+H(pi) = entropy of the policy — high when the policy is uncertain, low when it's deterministic. We maximize entropy (subtract it from loss) to encourage exploration. ent_coef = 0.01.
+Without the entropy term, the policy collapses to deterministic too early and stops exploring.
+
+10. The full PPO loop in plain words
+
+1. Use the current policy to play the environment for T steps.
+   Collect (s_t, a_t, r_t, log pi_old(a_t|s_t)) tuples.
+
+2. After T steps, compute:
+   - V(s_t) for all t  using the value network
+   - delta_t for all t
+   - A_t via GAE
+   - R_t = A_t + V(s_t)         (target for value network)
+   - normalize advantages: (A - mean) / std
+
+3. For K_epochs (say 10):
+     For each minibatch of size B:
+        - Forward pass: get pi_new(a_t|s_t) and V_new(s_t)
+        - Compute ratio = exp(log pi_new - log pi_old)
+        - Compute L_clip, L_value, L_ent, sum into L_total
+        - Backprop, optimizer step
+        - Clip gradients
+
+4. Throw away the rollout. Go back to step 1.
+The key insight: by reusing the same T-step rollout for K epochs of mini-batched SGD, PPO is sample-efficient (squeezes a lot of learning out of each interaction).
+
+11. Tying it to your warehouse
+For the PPS agent at decision step t:
+
+State s_t: which pods are idle, what SKUs they have, where they are, what stations need
+Action a_t: a vector — which station each candidate pod should go to (or stay idle)
+Reward r_t: pile-on this step minus α × order-completion-time-this-step
+V(s_t): the critic's guess of "from this warehouse state, total future reward ≈ ?"
+A_t: how much better/worse the chosen pod-to-station assignments turned out vs. the critic's expectation
+PPO update: nudge the policy to do more of the assignments that yielded high A_t, but not so much that the policy moves more than ±20% per update
+The whole system runs that loop continuously: collect 4096 steps of warehouse interaction → 10 epochs of mini-batched SGD → repeat. Over hundreds of episodes, the policy slowly learns "if station X has high SKU-Y demand and pod Z has lots of SKU Y nearby, assign Z to X" — patterns it discovers from gradient signal alone.
+
+
+
+
+
+
+
+
+
+
+Summary:
+s_t -> state (observation)
+a_t -> action
+r_t -> reward
+
+Network policy:
+policy network (pi theta) -> probability of action
+value network (V_phi) -> prediction of total future reward
+
+G_t -> measurer of how good a trajectory is (what actually happened)
+G_t  =  r_t  +  gamma * r_{t+1}  +  gamma^2 * r_{t+2}  +  ...
+gamma -> how much do i value reward right now vs future
+
+A_t -> advantage, to know is the action better or worse than the average behavior
+A_t  =  G_t  -  V(s_t)
+V(s_t) -> what we expect to happen on average from this state
+
+TD error:
+one step approximation instead of G_t
+delta_t  =  r_t  +  gamma * V(s_{t+1})  -  V(s_t)
+
+Generalized Advantage Estimation (GAE):
+balance bias vs variance
+A_t  =  sum_{l=0..}  (gamma * lambda)^l  *  delta_{t+l}
+
+     =  delta_t  +  (gamma*lambda) * delta_{t+1}  +  (gamma*lambda)^2 * delta_{t+2}  +  ...
+
+lambda -> weight that balances bias-variance
+lambda 0 -> A_t = delta_t (relies on V being accurate)
+lambda 1 -> A_t = G_t - V(s_t) (uses the actual trajectory)
+
+Policy gradient:
+how A_t is used:
+increase prob. of action whose advantage was positive, decrease for negative
+basically pi_theta(a_t|s_t) goes up when A_t>0 and down when A_t <0
+
+Ratio in PPO
+ratio  =  pi_theta_new(a_t|s_t)  /  pi_theta_old(a_t|s_t)
+       =  exp( log pi_new  -  log pi_old )
+
+PPO objective:
+L_clip  =  - mean( min(ratio * A_t, clip(ratio, 1-epsilon, 1+epsilon) * A_t) )
+basically if A_t > 0 increase prob. only up to (1+epsilon)*A_t
+and if A_t < 0 increase prob. only up to (1-epsilon)*A_t
+epsilon = 0.2
+basically improve but dont change more than +-20%
+
+The full loss:
+L_total  =  L_clip  +  vf_coef * L_value  -  ent_coef * H(pi)
+L_clip -> PPO objective
+L_value = mean( (V_phi(s) - R_t)^2 ) -> prediction of total reward vs actual reward
+vf_coef = 0.5
+H(pi) -> entropy of the policy (high when policy is uncertain and low when deterministic)
