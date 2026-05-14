@@ -96,6 +96,8 @@ class Inventory(Universe):
         self.pps_pileon = True
         self.pps_demand = False
         self.pps_rl = False       # When True, PPS is controlled by RL agent (PPSEnv)
+        self.pps_picked_quantity = 0
+        self.pps_pod_visits = 0
         self.joint_rl = False     # When True, both POA and PPS are controlled by JointEnv
 
         self.priority_order = False
@@ -783,6 +785,10 @@ class Inventory(Universe):
         pod.station = station
         # print(f"[DEBUG] assign job pod {pod.id} coordinate {pod.coordinate}")
         self.pod_manager.mark_pod_not_available(pod)
+        picked_quantity = sum(qty for _order_id, _sku, qty in job.orders)
+        if picked_quantity > 0:
+            self.pps_picked_quantity = getattr(self, "pps_picked_quantity", 0) + picked_quantity
+            self.pps_pod_visits = getattr(self, "pps_pod_visits", 0) + 1
         return job
 
     def find_pod_with_the_highest_pile_on(self, sku_to_quantity: dict) -> (Pod, int): # type: ignore

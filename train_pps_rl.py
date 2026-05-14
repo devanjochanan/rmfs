@@ -22,13 +22,21 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
+import inspect
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 from datetime import datetime
 from typing import Any, Dict, List
+
+# Keep Matplotlib/SB3 font-cache writes inside the project folder on Windows.
+_MPLCONFIGDIR = os.path.join(os.path.dirname(__file__), ".matplotlib")
+os.makedirs(_MPLCONFIGDIR, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", _MPLCONFIGDIR)
 
 import numpy as np
 from tqdm import tqdm
@@ -40,6 +48,59 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from torch.utils.tensorboard import SummaryWriter
 
 from pps_env import PPSEnv
+
+try:
+    from pps_env import ALPHA_OCT, PICKED_QTY_WEIGHT, POD_VISIT_PENALTY
+except ImportError:
+    PICKED_QTY_WEIGHT = 0.0
+    ALPHA_OCT = 1.0
+    POD_VISIT_PENALTY = 0.0
+
+
+_PPS_ENV_INIT_ARGS = set(inspect.signature(PPSEnv.__init__).parameters)
+
+
+def ensure_numpy_pickle_compat() -> None:
+    """Allow NumPy 2.x SB3 archives to load in older NumPy 1.x environments."""
+    try:
+        import numpy.core as numpy_core
+    except ImportError:
+        return
+
+    sys.modules.setdefault("numpy._core", numpy_core)
+    for submodule in (
+        "multiarray",
+        "umath",
+        "numeric",
+        "fromnumeric",
+        "_multiarray_umath",
+        "_methods",
+        "overrides",
+    ):
+        try:
+            module = importlib.import_module(f"numpy.core.{submodule}")
+        except Exception:
+            continue
+        sys.modules.setdefault(f"numpy._core.{submodule}", module)
+
+
+def make_pps_env_kwargs(
+    max_ticks: int,
+    picked_qty_weight: float,
+    reward_alpha: float,
+    visit_penalty: float,
+) -> Dict[str, float | int]:
+    """Build env kwargs compatible with both newer and older PPSEnv versions."""
+    kwargs: Dict[str, float | int] = {}
+    if "max_episode_ticks" in _PPS_ENV_INIT_ARGS:
+        kwargs["max_episode_ticks"] = max_ticks
+    if "reward_picked_qty_weight" in _PPS_ENV_INIT_ARGS:
+        kwargs["reward_picked_qty_weight"] = picked_qty_weight
+    if "reward_alpha" in _PPS_ENV_INIT_ARGS:
+        kwargs["reward_alpha"] = reward_alpha
+    if "reward_visit_penalty" in _PPS_ENV_INIT_ARGS:
+        kwargs["reward_visit_penalty"] = visit_penalty
+    return kwargs
 
 # ---------------------------------------------------------------------------
 # Paths (defaults, overridable via CLI)
@@ -264,6 +325,7 @@ def make_worker_env(
     worker_id: int,
     base_dir: str,
     max_ticks: int,
+    picked_qty_weight: float,
     reward_alpha: float,
     visit_penalty: float,
 ):
@@ -299,11 +361,12 @@ def make_worker_env(
         import model.order_generator as og_mod
         og_mod.parent_directory = workdir
 
-        return PPSEnv(
-            max_episode_ticks=max_ticks,
-            reward_alpha=reward_alpha,
-            reward_visit_penalty=visit_penalty,
-        )
+        return PPSEnv(**make_pps_env_kwargs(
+            max_ticks,
+            picked_qty_weight,
+            reward_alpha,
+            visit_penalty,
+        ))
     return _init
 
 
@@ -313,21 +376,23 @@ def make_worker_env(
 def train(
     total_episodes: int = 50,
     resume: bool = False,
-    learning_rate: float = 3e-4,
+    learning_rate: float = 1e-4,
     lr_end: float | None = None,
     lr_plan_episodes: int | None = None,
-    batch_size: int = 64,
-    n_epochs: int = 10,
+    batch_size: int = 256,
+    n_epochs: int = 5,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     clip_range: float = 0.2,
+    target_kl: float | None = 0.03,
     ent_coef: float = 0.01,
     vf_coef: float = 0.5,
     max_grad_norm: float = 0.5,
     max_episode_ticks: int = 32400,
-    reward_alpha: float = 0.001,
-    visit_penalty: float = 1.0,
-    n_steps: int = 4096,
+    picked_qty_weight: float = PICKED_QTY_WEIGHT,
+    reward_alpha: float = ALPHA_OCT,
+    visit_penalty: float = POD_VISIT_PENALTY,
+    n_steps: int = 8192,
     n_envs: int = 1,
 ):
     """
@@ -349,10 +414,12 @@ def train(
         gamma: Discount factor.
         gae_lambda: GAE lambda for advantage estimation.
         clip_range: PPO clipping parameter.
+        target_kl: Early-stop PPO epochs when the policy update moves too far.
         ent_coef: Entropy bonus coefficient (encourages exploration).
         vf_coef: Value function loss coefficient.
         max_grad_norm: Gradient clipping norm.
         max_episode_ticks: Max simulation ticks per episode.
+        picked_qty_weight: Reward per picked unit.
         reward_alpha: Weight for average completion time penalty.
         visit_penalty: Penalty per successful pod-station visit.
         n_steps: Steps per PPO rollout (set >= typical episode length).
@@ -370,6 +437,7 @@ def train(
                 i,
                 base_dir,
                 max_episode_ticks,
+                picked_qty_weight,
                 reward_alpha,
                 visit_penalty,
             )
@@ -379,11 +447,12 @@ def train(
         print(f"Using SubprocVecEnv with {n_envs} parallel workers.")
     else:
         vec_env = DummyVecEnv([
-            make_pps_env(
-                max_episode_ticks=max_episode_ticks,
-                reward_alpha=reward_alpha,
-                reward_visit_penalty=visit_penalty,
-            )
+            make_pps_env(**make_pps_env_kwargs(
+                max_episode_ticks,
+                picked_qty_weight,
+                reward_alpha,
+                visit_penalty,
+            ))
         ])
 
     # Load previous training state if resuming
@@ -417,6 +486,8 @@ def train(
     if lr_end is None:
         lr_end = learning_rate * 0.1
 
+    lr_schedule = get_linear_fn(learning_rate, lr_end, end_fraction=1.0)
+
     # TensorBoard + CSV (reuse same folder on resume for continuous graph)
     tb_writer = SummaryWriter(log_dir=os.path.join(LOG_DIR, run_name))
     csv_path = os.path.join(METRICS_DIR, f"metrics_{run_name}.csv")
@@ -424,15 +495,22 @@ def train(
 
     if resume and os.path.exists(BEST_MODEL + ".zip"):
         print(f"Resuming from {BEST_MODEL}")
+        ensure_numpy_pickle_compat()
         model = PPO.load(BEST_MODEL, env=vec_env, device="cpu")
         model.tensorboard_log = os.path.join(LOG_DIR, run_name)
         # PPO.load restores lr_schedule (the linear decay fn) and optimizer state.
         current_progress = 1.0 - float(model.num_timesteps) / float(plan_total_timesteps)
         current_progress = max(0.0, min(1.0, current_progress))
-        current_lr = model.lr_schedule(current_progress)
+        current_lr = lr_schedule(current_progress)
         print(f"  Restored num_timesteps: {model.num_timesteps}")
         print(f"  Current scheduled LR:   {current_lr:.2e}")
+        model.lr_schedule = lr_schedule
+        for param_group in model.policy.optimizer.param_groups:
+            param_group["lr"] = current_lr
         model.n_steps = n_steps
+        model.batch_size = batch_size
+        model.n_epochs = n_epochs
+        model.target_kl = target_kl
         # Recreate rollout buffer to match new n_steps
         from stable_baselines3.common.buffers import DictRolloutBuffer
         model.rollout_buffer = DictRolloutBuffer(
@@ -442,13 +520,12 @@ def train(
             device=model.device,
             gamma=model.gamma,
             gae_lambda=model.gae_lambda,
-            n_envs=1,
+            n_envs=n_envs,
         )
     else:
         print("Training from scratch")
         # Linear LR schedule from learning_rate -> lr_end over plan_total_timesteps.
         # get_linear_fn is picklable, so it persists through model.save/load.
-        lr_schedule = get_linear_fn(learning_rate, lr_end, end_fraction=1.0)
         model = PPO(
             "MultiInputPolicy",
             vec_env,
@@ -459,6 +536,7 @@ def train(
             gamma=gamma,
             gae_lambda=gae_lambda,
             clip_range=clip_range,
+            target_kl=target_kl,
             ent_coef=ent_coef,
             vf_coef=vf_coef,
             max_grad_norm=max_grad_norm,
@@ -491,9 +569,12 @@ def train(
     print(f"  Gamma                    : {gamma}")
     print(f"  GAE lambda               : {gae_lambda}")
     print(f"  Clip range               : {clip_range}")
+    print(f"  Target KL                : {target_kl}")
     print(f"  Entropy coef             : {ent_coef}")
+    print(f"  Reward objective         : minimize avg completion time")
+    print(f"  Reward picked qty weight : {picked_qty_weight} (inactive)")
     print(f"  Reward OCT alpha         : {reward_alpha}")
-    print(f"  Reward visit penalty     : {visit_penalty}")
+    print(f"  Reward visit penalty     : {visit_penalty} (inactive)")
     print(f"  Max episode ticks        : {max_episode_ticks}")
     print(f"  TensorBoard              : python -m tensorboard.main --logdir \"{os.path.abspath(LOG_DIR)}\"")
     print(f"  CSV metrics              : {csv_path}")
@@ -555,14 +636,31 @@ def train(
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
-def evaluate(n_episodes: int = 5):
+def evaluate(
+    n_episodes: int = 1,
+    max_episode_ticks: int = 32400,
+    picked_qty_weight: float = PICKED_QTY_WEIGHT,
+    reward_alpha: float = ALPHA_OCT,
+    visit_penalty: float = POD_VISIT_PENALTY,
+):
     """Evaluate trained PPS model and print per-episode results."""
     if not os.path.exists(BEST_MODEL + ".zip"):
         print(f"No model found at {BEST_MODEL}. Train first.")
         return
 
-    env = PPSEnv()
+    env_kwargs = make_pps_env_kwargs(
+        max_episode_ticks,
+        picked_qty_weight,
+        reward_alpha,
+        visit_penalty,
+    )
+    env = PPSEnv(**env_kwargs)
+    ensure_numpy_pickle_compat()
     model = PPO.load(BEST_MODEL, device="cpu")
+    print(
+        f"Loaded model: {BEST_MODEL}.zip "
+        f"(episodes={n_episodes}, max_ticks={max_episode_ticks})"
+    )
 
     results = []
     for ep in range(1, n_episodes + 1):
@@ -601,6 +699,7 @@ def evaluate(n_episodes: int = 5):
     print(f"  Avg order completion    : {avg_oct:.1f} ticks")
     print(f"  Avg cumulative path cost: {avg_cpc:.1f}")
     print(f"{'='*50}")
+    env.close()
 
 
 # ---------------------------------------------------------------------------
@@ -612,32 +711,38 @@ if __name__ == "__main__":
                         help="Resume training from checkpoint")
     parser.add_argument("--eval", action="store_true",
                         help="Evaluate trained model")
+    parser.add_argument("--eval-episodes", type=int, default=1,
+                        help="Number of episodes to run during --eval")
     parser.add_argument("--episodes", type=int, default=50,
                         help="Approximate number of episodes to train")
-    parser.add_argument("--lr", type=float, default=3e-4,
+    parser.add_argument("--lr", type=float, default=1e-4,
                         help="Initial learning rate (start of linear decay)")
     parser.add_argument("--lr-end", type=float, default=None,
                         help="Final learning rate (default: lr * 0.1)")
     parser.add_argument("--lr-plan-episodes", type=int, default=None,
                         help="LR decay horizon in episodes. Persisted across "
                              "resumes. Default on first run = --episodes.")
-    parser.add_argument("--batch-size", type=int, default=64,
+    parser.add_argument("--batch-size", type=int, default=256,
                         help="Minibatch size")
-    parser.add_argument("--epochs", type=int, default=10,
+    parser.add_argument("--epochs", type=int, default=5,
                         help="PPO epochs per update")
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="Discount factor")
     parser.add_argument("--ent-coef", type=float, default=0.01,
                         help="Entropy coefficient")
-    parser.add_argument("--reward-alpha", type=float, default=0.001,
+    parser.add_argument("--target-kl", type=float, default=0.03,
+                        help="Early-stop PPO updates above this approximate KL")
+    parser.add_argument("--picked-qty-weight", type=float, default=PICKED_QTY_WEIGHT,
+                        help="Inactive compatibility option; picked quantity is logged only")
+    parser.add_argument("--reward-alpha", type=float, default=ALPHA_OCT,
                         help="Weight for average completion time penalty")
-    parser.add_argument("--visit-penalty", type=float, default=1.0,
-                        help="Penalty per successful pod-station visit")
+    parser.add_argument("--visit-penalty", type=float, default=POD_VISIT_PENALTY,
+                        help="Inactive compatibility option; pod visits are logged only")
     parser.add_argument("--save-path", type=str, default=None,
                         help="Override model save directory")
     parser.add_argument("--max-ticks", type=int, default=32400,
                         help="Max simulation ticks per episode (default 32400 = 9h)")
-    parser.add_argument("--n-steps", type=int, default=4096,
+    parser.add_argument("--n-steps", type=int, default=8192,
                         help="Steps per PPO rollout (set >= typical episode length)")
     parser.add_argument("--n-envs", type=int, default=1,
                         help="Number of parallel envs (SubprocVecEnv). 1 = serial.")
@@ -654,7 +759,13 @@ if __name__ == "__main__":
         CHECKPOINT_DIR = os.path.join(save_dir, "checkpoints")
 
     if args.eval:
-        evaluate()
+        evaluate(
+            n_episodes=args.eval_episodes,
+            max_episode_ticks=args.max_ticks,
+            picked_qty_weight=args.picked_qty_weight,
+            reward_alpha=args.reward_alpha,
+            visit_penalty=args.visit_penalty,
+        )
     else:
         train(
             total_episodes=args.episodes,
@@ -665,7 +776,9 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             n_epochs=args.epochs,
             gamma=args.gamma,
+            target_kl=args.target_kl,
             ent_coef=args.ent_coef,
+            picked_qty_weight=args.picked_qty_weight,
             reward_alpha=args.reward_alpha,
             visit_penalty=args.visit_penalty,
             max_episode_ticks=args.max_ticks,

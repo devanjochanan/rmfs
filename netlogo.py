@@ -2,6 +2,7 @@ import csv
 import pickle
 import os
 import traceback
+from collections import defaultdict
 from typing import List
 import random
 import warnings
@@ -29,7 +30,7 @@ from model.pod_generator import PodGenerator
 # DB
 from model.tools.pod_location import clear_pod_locations, initialize_pod_location_table, upsert_pod_location
 from model.tools.pod_travel import clear_pod_travel, initialize_pod_travel_table
-from model.tools.job_task import clear_job_task_table, initialize_job_task_table
+from model.tools.job_task import clear_job_task_table, initialize_job_task_table, upsert_job_task
 from model.tools.order_history import clear_order_history, initialize_order_history_table
 
 from pip._internal import main as pipmain
@@ -37,6 +38,485 @@ from pip._internal import main as pipmain
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 ACTIVATE_NEAREST = True
+
+PPS_RL_NUM_STATIONS = 3
+PPS_RL_TOP_K_SKUS = 50
+PPS_RL_MAX_PODS = 60
+PPS_RL_NUM_TRAFFIC_ZONES = 5
+PPS_RL_MAX_ZONE_ROBOT_COUNT = 100.0
+PPS_RL_TRAFFIC_ZONES = (
+    ((5, 43), (0, 5)),
+    ((5, 43), (6, 11)),
+    ((5, 43), (12, 18)),
+    ((5, 43), (19, 24)),
+    ((5, 43), (25, 30)),
+)
+PPS_RL_POD_FEATURE_DIM = (
+    PPS_RL_TOP_K_SKUS
+    + PPS_RL_NUM_STATIONS
+    + PPS_RL_NUM_STATIONS
+    + PPS_RL_NUM_TRAFFIC_ZONES
+)
+PPS_RL_MODEL_PATH = os.environ.get(
+    "PPS_RL_MODEL_PATH",
+    os.path.join(os.path.dirname(__file__), "saved_models", "pps_rl_best.zip"),
+)
+
+_PPS_RL_MODEL = None
+_PPS_RL_LOAD_ATTEMPTED = False
+_PPS_RL_ACTIVE_LOGGED = False
+_PPS_MODE = os.environ.get("PPS_MODE", "ppo").strip().lower()
+
+
+def _pps_rl_enabled():
+    value = os.environ.get("PPS_RL_ENABLED", "1").strip().lower()
+    return _PPS_MODE == "ppo" and value not in {"0", "false", "no", "off"}
+
+
+def _normalize_pps_mode(mode):
+    mode = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
+    if mode in {"ppo", "rl", "pps_rl", "ppo_pps"}:
+        return "ppo"
+    if mode in {"rika", "rika_pps", "heuristic", "pile_on", "pileon", "baseline"}:
+        return "heuristic"
+    if mode in {"demand", "demand_pps"}:
+        return "demand"
+    return "ppo"
+
+
+def _pps_rl_model_candidates():
+    paths = [PPS_RL_MODEL_PATH]
+    if not PPS_RL_MODEL_PATH.endswith(".zip"):
+        paths.append(PPS_RL_MODEL_PATH + ".zip")
+    return paths
+
+
+def _ensure_numpy_pickle_compat():
+    """Allow NumPy 2.x SB3 archives to load in older NumPy 1.x environments."""
+    try:
+        import importlib
+        import sys
+        import numpy.core as numpy_core
+    except ImportError:
+        return
+
+    sys.modules.setdefault("numpy._core", numpy_core)
+    for submodule in (
+        "multiarray",
+        "umath",
+        "numeric",
+        "fromnumeric",
+        "_multiarray_umath",
+        "_methods",
+        "overrides",
+    ):
+        try:
+            module = importlib.import_module(f"numpy.core.{submodule}")
+        except Exception:
+            continue
+        sys.modules.setdefault(f"numpy._core.{submodule}", module)
+
+
+def _pps_rl_model_matches_current_observation(model):
+    spaces = getattr(getattr(model, "observation_space", None), "spaces", None)
+    if not spaces:
+        return False
+
+    required = {
+        "pod_features",
+        "station_features",
+        "num_candidates",
+        "zone_robot_counts",
+    }
+    if not required.issubset(spaces.keys()):
+        return False
+
+    return (
+        spaces["pod_features"].shape == (PPS_RL_MAX_PODS, PPS_RL_POD_FEATURE_DIM)
+        and spaces["station_features"].shape == (
+            PPS_RL_NUM_STATIONS,
+            PPS_RL_TOP_K_SKUS,
+        )
+        and spaces["num_candidates"].shape == (1,)
+        and spaces["zone_robot_counts"].shape == (PPS_RL_NUM_TRAFFIC_ZONES,)
+    )
+
+
+def _load_pps_rl_model():
+    global _PPS_RL_MODEL, _PPS_RL_LOAD_ATTEMPTED
+
+    if _PPS_RL_MODEL is not None:
+        return _PPS_RL_MODEL
+    if _PPS_RL_LOAD_ATTEMPTED or not _pps_rl_enabled():
+        return None
+
+    _PPS_RL_LOAD_ATTEMPTED = True
+    model_path = next((path for path in _pps_rl_model_candidates() if os.path.exists(path)), None)
+    if model_path is None:
+        print(f"[PPS_RL] Model not found at {PPS_RL_MODEL_PATH}. Using heuristic PPS.")
+        return None
+
+    try:
+        from stable_baselines3 import PPO
+        _ensure_numpy_pickle_compat()
+        model = PPO.load(model_path, device="cpu")
+        if not _pps_rl_model_matches_current_observation(model):
+            print(
+                "[PPS_RL] Loaded model uses the old observation shape. "
+                "Retrain PPO after the traffic-zone feature update."
+            )
+            return None
+        _PPS_RL_MODEL = model
+        print(f"[PPS_RL] Loaded PPO model from {model_path}")
+        return _PPS_RL_MODEL
+    except Exception:
+        print("[PPS_RL] Failed to load PPO model. Using heuristic PPS.")
+        traceback.print_exc()
+        return None
+
+
+def _build_pps_rl_sku_index(universe):
+    sku_counts = {}
+    for pod in universe.pod_manager.pods:
+        for sku, details in pod.skus.items():
+            sku_counts[sku] = sku_counts.get(sku, 0) + details["current_qty"]
+
+    sorted_skus = sorted(sku_counts.items(), key=lambda item: item[1], reverse=True)
+    return {sku: i for i, (sku, _) in enumerate(sorted_skus[:PPS_RL_TOP_K_SKUS])}
+
+
+def _configure_pps_rl_strategy(universe):
+    """Enable PPO PPS when the model is available; otherwise keep heuristic PPS."""
+    global _PPS_RL_ACTIVE_LOGGED
+
+    if _PPS_MODE == "heuristic":
+        universe.pps_rl = False
+        universe.pps_pileon = True
+        universe.pps_demand = False
+        return False
+
+    if _PPS_MODE == "demand":
+        universe.pps_rl = False
+        universe.pps_pileon = False
+        universe.pps_demand = True
+        return False
+
+    if _load_pps_rl_model() is None:
+        universe.pps_rl = False
+        universe.pps_pileon = True
+        universe.pps_demand = False
+        return False
+
+    universe.pps_pileon = False
+    universe.pps_demand = False
+    universe.pps_rl = True
+
+    if not hasattr(universe, "pps_rl_sku_index"):
+        universe.pps_rl_sku_index = _build_pps_rl_sku_index(universe)
+    if not hasattr(universe, "pps_picked_quantity"):
+        universe.pps_picked_quantity = 0
+    if not hasattr(universe, "pps_pod_visits"):
+        universe.pps_pod_visits = 0
+
+    if not _PPS_RL_ACTIVE_LOGGED:
+        print("[PPS_RL] NetLogo simulation is using PPO for pick-pod selection.")
+        _PPS_RL_ACTIVE_LOGGED = True
+    return True
+
+
+def set_pps_mode(mode):
+    """Switch PPS mode for NetLogo: 'ppo', 'heuristic'/'rika', or 'demand'."""
+    global _PPS_MODE, _PPS_RL_LOAD_ATTEMPTED, _PPS_RL_ACTIVE_LOGGED
+
+    _PPS_MODE = _normalize_pps_mode(mode)
+    if _PPS_MODE == "ppo" and _PPS_RL_MODEL is None:
+        _PPS_RL_LOAD_ATTEMPTED = False
+    _PPS_RL_ACTIVE_LOGGED = False
+
+    if os.path.exists("netlogo.state"):
+        try:
+            with open("netlogo.state", "rb") as file:
+                universe = pickle.load(file)
+            for obj in universe._objects:
+                obj.setUniverse(universe)
+            _configure_pps_rl_strategy(universe)
+            with open("netlogo.state", "wb") as file:
+                pickle.dump(universe, file)
+        except Exception:
+            traceback.print_exc()
+
+    print(f"[PPS_MODE] Current PPS mode: {_PPS_MODE}")
+    return _PPS_MODE
+
+
+def _pps_rl_station_demands(universe, use_committed=True):
+    demands = {}
+    for station in universe.station_manager.picking_stations:
+        station_demand = defaultdict(int)
+        for order in station.orders:
+            order_skus = order.get_remaining_skus() if use_committed else order.get_unpicked_skus()
+            for sku, qty in order_skus.items():
+                station_demand[sku] += qty
+        demands[station.station_id] = dict(station_demand)
+    return demands
+
+
+def _pps_rl_incoming_pod_commits(universe):
+    commits = defaultdict(lambda: defaultdict(int))
+    for job in universe.job_queue:
+        if job is None or job.is_finished:
+            continue
+        for _order_id, sku, qty in job.orders:
+            commits[job.station_id][sku] += qty
+
+    for obj in universe.get_movable_objects():
+        if obj.object_type != "robot":
+            continue
+        job = obj.job
+        if job is None or job.is_finished:
+            continue
+        for _order_id, sku, qty in job.orders:
+            commits[job.station_id][sku] += qty
+    return commits
+
+
+def _pps_rl_future_station_demands(universe):
+    current = _pps_rl_station_demands(universe, use_committed=False)
+    incoming = _pps_rl_incoming_pod_commits(universe)
+    future = {}
+    for station_id, cur_demand in current.items():
+        inc_demand = incoming.get(station_id, {})
+        remaining = {}
+        for sku, qty in cur_demand.items():
+            qty_left = qty - inc_demand.get(sku, 0)
+            if qty_left > 0:
+                remaining[sku] = qty_left
+        future[station_id] = remaining
+    return future
+
+
+def _pps_rl_candidate_pods(universe):
+    station_demands = _pps_rl_station_demands(universe)
+    demand_skus = set()
+    for demand in station_demands.values():
+        demand_skus.update(demand.keys())
+
+    if not demand_skus:
+        return []
+
+    candidates = []
+    for pod in universe.pod_manager.pods:
+        if not universe.pod_manager.is_idle(pod.pod_id):
+            continue
+        pod_skus = {
+            sku for sku, details in pod.skus.items()
+            if details["current_qty"] > 0
+        }
+        if pod_skus & demand_skus:
+            candidates.append(pod)
+    return candidates[:PPS_RL_MAX_PODS]
+
+
+def _pps_rl_decision_needed(universe):
+    for station in universe.station_manager.picking_stations:
+        for order in station.orders:
+            if order.get_remaining_skus():
+                return len(_pps_rl_candidate_pods(universe)) > 0
+    return False
+
+
+def _pps_rl_traffic_zone_index(x, y):
+    for idx, ((min_x, max_x), (min_y, max_y)) in enumerate(PPS_RL_TRAFFIC_ZONES):
+        if min_x <= x <= max_x and min_y <= y <= max_y:
+            return idx
+    return None
+
+
+def _pps_rl_zone_robot_counts(universe):
+    counts = np.zeros(PPS_RL_NUM_TRAFFIC_ZONES, dtype=np.float32)
+    for obj in universe.get_movable_objects():
+        if getattr(obj, "object_type", None) != "robot":
+            continue
+        zone_idx = _pps_rl_traffic_zone_index(obj.pos_x, obj.pos_y)
+        if zone_idx is not None:
+            counts[zone_idx] += 1.0
+    return counts
+
+
+def _build_pps_rl_observation(universe):
+    if not hasattr(universe, "pps_rl_sku_index"):
+        universe.pps_rl_sku_index = _build_pps_rl_sku_index(universe)
+
+    sku_index = universe.pps_rl_sku_index
+    candidates = _pps_rl_candidate_pods(universe)
+    station_demands = _pps_rl_station_demands(universe)
+    future_demands = _pps_rl_future_station_demands(universe)
+    stations = sorted(universe.station_manager.picking_stations, key=lambda s: s.station_id)
+    station_ids = [station.station_id for station in stations]
+    station_pos = [(station.pos_x, station.pos_y) for station in stations]
+
+    pod_features = np.zeros((PPS_RL_MAX_PODS, PPS_RL_POD_FEATURE_DIM), dtype=np.float32)
+    station_features = np.zeros((PPS_RL_NUM_STATIONS, PPS_RL_TOP_K_SKUS), dtype=np.float32)
+    zone_robot_counts = _pps_rl_zone_robot_counts(universe)
+
+    for j, station_id in enumerate(station_ids[:PPS_RL_NUM_STATIONS]):
+        for sku, qty in future_demands.get(station_id, {}).items():
+            idx = sku_index.get(sku)
+            if idx is not None:
+                station_features[j, idx] = min(qty / 100.0, 1.0)
+
+    max_dist = 49.0 + 31.0
+    for i, pod in enumerate(candidates):
+        for sku, details in pod.skus.items():
+            idx = sku_index.get(sku)
+            if idx is not None:
+                pod_features[i, idx] = min(details["current_qty"] / 100.0, 1.0)
+
+        for j, (station_x, station_y) in enumerate(station_pos[:PPS_RL_NUM_STATIONS]):
+            dist = abs(pod.pos_x - station_x) + abs(pod.pos_y - station_y)
+            pod_features[i, PPS_RL_TOP_K_SKUS + j] = 1.0 - min(dist / max_dist, 1.0)
+
+        for j, station_id in enumerate(station_ids[:PPS_RL_NUM_STATIONS]):
+            demand = station_demands.get(station_id, {})
+            if not demand:
+                continue
+
+            matched = 0
+            total_demand = sum(demand.values())
+            for sku, req_qty in demand.items():
+                if sku in pod.skus:
+                    matched += min(pod.skus[sku]["current_qty"], req_qty)
+            pod_features[i, PPS_RL_TOP_K_SKUS + PPS_RL_NUM_STATIONS + j] = (
+                min(matched / max(total_demand, 1), 1.0)
+            )
+
+        zone_idx = _pps_rl_traffic_zone_index(pod.pos_x, pod.pos_y)
+        if zone_idx is not None:
+            zone_offset = (
+                PPS_RL_TOP_K_SKUS
+                + PPS_RL_NUM_STATIONS
+                + PPS_RL_NUM_STATIONS
+            )
+            pod_features[i, zone_offset + zone_idx] = 1.0
+
+    return {
+        "pod_features": pod_features,
+        "station_features": station_features,
+        "num_candidates": np.array([len(candidates)], dtype=np.int32),
+        "zone_robot_counts": zone_robot_counts,
+    }
+
+
+def _execute_pps_rl_actions(universe, actions):
+    candidates = _pps_rl_candidate_pods(universe)
+    station_ids = sorted(
+        station.station_id
+        for station in universe.station_manager.picking_stations
+    )
+    flat_actions = np.asarray(actions).reshape(-1)
+    assignments = 0
+
+    for i in range(min(len(candidates), len(flat_actions))):
+        action = int(flat_actions[i])
+        if action == 0 or action < 1 or action > PPS_RL_NUM_STATIONS:
+            continue
+
+        pod = candidates[i]
+        station = universe.station_manager.get_station_by_id(station_ids[action - 1])
+
+        if not universe.pod_manager.is_idle(pod.pod_id):
+            continue
+        if len(station.incoming_pod) >= station.max_robots:
+            continue
+        if not station.orders:
+            continue
+
+        sku_to_quantity = defaultdict(int)
+        sku_to_order_map = defaultdict(list)
+        for order in station.orders:
+            for sku, qty in order.get_remaining_skus().items():
+                sku_to_quantity[sku] += qty
+                sku_to_order_map[sku].append((order.order_id, qty))
+
+        if not sku_to_quantity:
+            continue
+        has_match = any(
+            sku in pod.skus and pod.skus[sku]["current_qty"] > 0
+            for sku in sku_to_quantity
+        )
+        if not has_match:
+            continue
+
+        job = universe.add_picking_task_after_pps(
+            station,
+            pod,
+            sku_to_order_map,
+            sku_to_quantity,
+        )
+        if len(job.orders) == 0:
+            continue
+
+        universe.job_queue.append(job)
+        assignments += 1
+        for order_id, sku, qty in job.orders:
+            upsert_job_task(
+                pod_id=str(job.pod.pod_id),
+                order_id=str(order_id),
+                sku=str(sku),
+                qty=str(qty),
+                assigned_station=station.station_id,
+                pod_assigned_time=universe._tick,
+                status="queue",
+            )
+
+    return assignments
+
+
+def _apply_pps_rl_policy(universe):
+    if not getattr(universe, "pps_rl", False):
+        return 0
+    if not _pps_rl_decision_needed(universe):
+        return 0
+
+    model = _load_pps_rl_model()
+    if model is None:
+        return 0
+
+    observation = _build_pps_rl_observation(universe)
+    actions, _state = model.predict(observation, deterministic=True)
+    return _execute_pps_rl_actions(universe, actions)
+
+
+def _get_throughput(universe):
+    """Completed orders so far, matching the PPS training throughput metric."""
+    total_orders = len(universe.order_manager.orders)
+    unfinished_orders = len(universe.order_manager.unfinished_orders)
+    return max(total_orders - unfinished_orders, 0)
+
+
+def _get_avg_order_completion_time(universe):
+    completed_times = []
+    for order in universe.order_manager.orders:
+        if order.order_complete_time >= 0 and order.process_start_time >= 0:
+            completed_times.append(order.order_complete_time - order.process_start_time)
+    if not completed_times:
+        return 0
+    return sum(completed_times) / len(completed_times)
+
+
+def _get_pod_visits(universe):
+    return getattr(universe, "pps_pod_visits", getattr(universe, "pps_rl_pod_visits", 0))
+
+
+def _get_picked_quantity(universe):
+    return getattr(universe, "pps_picked_quantity", getattr(universe, "pps_rl_picked_quantity", 0))
+
+
+def _get_pile_on_rate(universe):
+    pod_visits = _get_pod_visits(universe)
+    if pod_visits <= 0:
+        return 0
+    return _get_picked_quantity(universe) / pod_visits
 
 
 class DirectedGraph:
@@ -859,6 +1339,7 @@ def setup():
 
         # Set simulation parameters
         universe.tick_to_second = 0.15
+        _configure_pps_rl_strategy(universe)
 
         # Generate initial results
         next_result = universe.generateResult()
@@ -885,9 +1366,11 @@ def tick():
         # Update each object with the current universe context
         for _n in universe._objects:
             _n.setUniverse(universe)
+        _configure_pps_rl_strategy(universe)
 
         # Perform a simulation tick
         next_result = universe.tick()
+        _apply_pps_rl_policy(universe)
         if universe._tick > 28800:
             return IndexError
 
@@ -899,7 +1382,9 @@ def tick():
         # next_result[0] contains object positions
         # next_result[1] contains station orders
         return [next_result[0], universe.total_energy, len(universe.job_queue), universe.stop_and_go,
-                universe.total_turning, next_result[1]]
+                universe.total_turning, next_result[1], _get_throughput(universe),
+                _get_avg_order_completion_time(universe), _get_pod_visits(universe),
+                _get_pile_on_rate(universe), _get_picked_quantity(universe)]
 
     except Exception as e:
         # Print complete stack trace
@@ -915,9 +1400,11 @@ def console_tick():
         # Update each object with the current universe context
         for _n in universe._objects:
             _n.setUniverse(universe)
+        _configure_pps_rl_strategy(universe)
         while True:
             # Perform a simulation tick
             next_result = universe.tick()
+            _apply_pps_rl_policy(universe)
             if universe._tick > 28800:
                 return IndexError
 
@@ -929,7 +1416,9 @@ def console_tick():
         # next_result[0] contains object positions
         # next_result[1] contains station orders
         return [next_result[0], universe.total_energy, len(universe.job_queue), universe.stop_and_go,
-                universe.total_turning, next_result[1]]
+                universe.total_turning, next_result[1], _get_throughput(universe),
+                _get_avg_order_completion_time(universe), _get_pod_visits(universe),
+                _get_pile_on_rate(universe), _get_picked_quantity(universe)]
 
     except Exception as e:
         # Print complete stack trace

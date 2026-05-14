@@ -1,0 +1,47 @@
+PPS RL traffic-zone input and completion-time reward changelog
+Date: 2026-05-13
+
+Changed files:
+- pps_env.py
+- netlogo.py
+- train_pps_rl.py
+
+What changed:
+- Added 5 horizontal traffic zones for PPS RL:
+  zone 1: x = 5..43, y = 0..5
+  zone 2: x = 5..43, y = 6..11
+  zone 3: x = 5..43, y = 12..18
+  zone 4: x = 5..43, y = 19..24
+  zone 5: x = 5..43, y = 25..30
+- Added robot traffic counts as a new global observation input:
+  zone_robot_counts = [zone1_count, zone2_count, zone3_count, zone4_count, zone5_count]
+- Added pod zone location to each candidate pod feature vector as a 5-value one-hot encoding.
+- Increased the PPS RL per-pod feature size from:
+  TOP_K_SKUS + 3 station distances + 3 station match values
+  to:
+  TOP_K_SKUS + 3 station distances + 3 station match values + 5 pod-zone values
+- Updated the NetLogo PPO inference observation builder to use the same traffic-aware observation shape as PPSEnv.
+- Added a NetLogo model-compatibility check so old PPO models fall back to heuristic PPS instead of crashing after the observation shape change.
+- Changed the active reward objective to only minimize average order completion time.
+- Picked quantity and pod visits are still logged as metrics, but no longer affect the reward.
+- Aligned PPSEnv timing with NetLogo by setting warehouse.tick_to_second = 0.15 during environment setup.
+
+New reward formula:
+reward =
+    - reward_alpha * avg_completion_time_delta
+
+Default reward weights after this change:
+reward_picked_qty_weight = 0.0
+reward_visit_penalty = 0.0
+reward_alpha = 1.0
+
+Important training note:
+- Existing PPO models trained before this change are not compatible with the new observation shape.
+- Retrain PPO from scratch before using PPO PPS in NetLogo.
+- Until a new compatible model is available, NetLogo will print a warning and fall back to heuristic PPS.
+- Training with tick_to_second = 0.15 can take longer than the old PPSEnv default of 0.25 because the backend advances in smaller time increments.
+
+Reason:
+- PPS pod selection should be aware of traffic congestion, because choosing a pod can affect robot movement and station queues.
+- The 5-zone input gives PPO a compact traffic summary without trying to solve full path planning directly.
+- The reward was simplified to focus the learning objective on reducing order completion time.

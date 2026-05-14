@@ -1,21 +1,37 @@
 PPS RL
 WINDOW 1 (Tensorboard)
-python -m tensorboard.main --logdir "C:\Users\Devan\Documents\RMFS Simulation\Fresh Start Main RMFS backup\saved_models\runs"
+cd "C:\Users\Devan\Documents\RMFS Simulation\Fresh Start Main RMFS backup"
+.\.venv\Scripts\python.exe -m tensorboard.main --logdir "C:\Users\Devan\Documents\RMFS Simulation\Fresh Start Main RMFS backup\saved_models\runs"
+
+python -m tensorboard.main --logdir "/home/citi/Documents/rmfs devan/saved_models"
+
 
 WINDOW 2A (Start train)
 cd "C:\Users\Devan\Documents\RMFS Simulation\Fresh Start Main RMFS backup"
-python train_pps_rl.py --episodes 500 --save-path saved_models/pps_rl.pt --max-ticks 3000
+.\.venv\Scripts\python.exe train_pps_rl.py --episodes 5000 --save-path saved_models/pps_rl.pt --max-ticks 3000 --picked-qty-weight 1.0 --visit-penalty 5.0 --reward-alpha 0.01 --lr 1e-4 --target-kl 0.03 --batch-size 256 --epochs 5 --n-steps 8192
 
 WINDOW 2B (Continue train)
-python train_pps_rl.py --resume --episodes 5000 --save-path saved_models/pps_rl.pt --max-ticks 3000
+.\.venv\Scripts\python.exe train_pps_rl.py --resume --episodes 5000 --save-path saved_models/pps_rl.pt --max-ticks 3000 --picked-qty-weight 1.0 --visit-penalty 5.0 --reward-alpha 0.01 --lr 1e-4 --target-kl 0.03 --batch-size 256 --epochs 5 --n-steps 8192
 
 
 JOINT
 WINDOW 1 (Tensorboard)
-python -m tensorboard.main --logdir "C:\Users\Devan\Documents\RMFS Simulation\Fresh Start Main RMFS backup\saved_models\joint_runs"
+cd "C:\Users\Devan\Documents\RMFS Simulation\Fresh Start Main RMFS backup"
+.\.venv\Scripts\python.exe -m tensorboard.main --logdir "C:\Users\Devan\Documents\RMFS Simulation\Fresh Start Main RMFS backup\saved_models\joint_runs"
 
 WINDOW 2A (Start train)
-python train_joint_rl.py --episodes 500 --max-ticks 3000
+.\.venv\Scripts\python.exe train_joint_rl.py --episodes 500 --max-ticks 3000
 
 WINDOW 2B (Continue train)
-python train_joint_rl.py --resume --episodes 10000 --max-ticks 3000
+.\.venv\Scripts\python.exe train_joint_rl.py --resume --episodes 10000 --max-ticks 3000
+
+
+
+
+VENV
+PowerShell:
+.\.venv\Scripts\Activate.ps1
+
+If activation is blocked:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1

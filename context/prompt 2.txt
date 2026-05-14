@@ -13,7 +13,7 @@ Inputs:
 Step 1: Check decision trigger
 Condition: If unassigned order >0
 
-No → wait until there is an unprocessed order
+No → wait until there is an unprocessed order 
 Yes → Continue
 
 Step 2: Check bin availability

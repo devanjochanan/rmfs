@@ -1,0 +1,30 @@
+PPS RL reward weight tuning changelog
+Date: 2026-05-04
+
+Changed files:
+- pps_env.py
+- train_pps_rl.py
+- how to train.txt
+
+What changed:
+- Made picked quantity an explicit reward weight instead of an implicit +1.
+- Changed the default PPS reward weights to:
+  reward_picked_qty_weight = 1.0
+  reward_visit_penalty = 5.0
+  reward_alpha = 0.01
+- Added --picked-qty-weight to train_pps_rl.py.
+- Updated --visit-penalty and --reward-alpha defaults to match the new reward balance.
+- Passed all three reward weights into PPSEnv for both serial and parallel training.
+- Added the active reward weights into the environment info dictionary.
+- Updated how to train.txt so PPS training commands show the reward weights explicitly.
+
+New reward formula:
+reward =
+    picked_qty_weight * picked_qty_delta
+    - visit_penalty * pod_visits_delta
+    - reward_alpha * avg_completion_time_delta
+
+Reason:
+- The previous visit penalty of 1.0 was too weak: almost any pod visit with one picked unit looked useful.
+- A visit penalty of 5.0 means a pod should usually pick several units to justify being sent.
+- A completion-time weight of 0.01 makes waiting time matter more, without letting it completely dominate picked quantity.

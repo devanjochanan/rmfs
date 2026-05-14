@@ -13,11 +13,14 @@ Observation:
         - SKU quantity vector over Top-K SKUs
         - Manhattan distance to each station
         - Match degree with each station's demand
+        - One-hot traffic zone where the pod is located
     Per station (global):
         - Future-state SKU demand = current SKU demand - incoming pods' SKUs
           that will be picked at that station
+    Global traffic:
+        - Robot count in each of the 5 traffic zones
 Reward:
-    picked quantity - pod visit penalty - average completion time penalty
+    negative average completion time for newly completed orders
 """
 
 from __future__ import annotations
@@ -49,9 +52,20 @@ from model.tools.job_task import upsert_job_task
 NUM_STATIONS = 3           # picker-0, picker-1, picker-2
 NUM_ACTIONS = NUM_STATIONS + 1   # 0=unassigned, 1..3=station
 TOP_K_SKUS = 50           # dimensionality of SKU feature vector per pod
-ALPHA_OCT = 0.001          # weight for order-completion-time penalty in reward
-POD_VISIT_PENALTY = 1.0    # per successful pod-station visit in reward
+PICKED_QTY_WEIGHT = 0.0    # kept for CLI compatibility; inactive in reward
+ALPHA_OCT = 1.0            # weight for order-completion-time penalty in reward
+POD_VISIT_PENALTY = 0.0    # kept for CLI compatibility; inactive in reward
 MAX_PODS_OBS = 60          # max pods we observe at once (padded if fewer)
+SIM_TICK_TO_SECOND = 0.15  # keep PPSEnv timing aligned with NetLogo
+NUM_TRAFFIC_ZONES = 5
+MAX_ZONE_ROBOT_COUNT = 100.0
+TRAFFIC_ZONES = (
+    ((5, 43), (0, 5)),
+    ((5, 43), (6, 11)),
+    ((5, 43), (12, 18)),
+    ((5, 43), (19, 24)),
+    ((5, 43), (25, 30)),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -93,8 +107,9 @@ class PPSEnv(gym.Env):
 
     def __init__(
         self,
-        max_episode_ticks: int = 32400,   # 9 hours * 3600 / 0.25
+        max_episode_ticks: int = 32400,   # 9 hours of simulation time
         use_heuristic_fallback: bool = True,
+        reward_picked_qty_weight: float = PICKED_QTY_WEIGHT,
         reward_alpha: float = ALPHA_OCT,
         reward_visit_penalty: float = POD_VISIT_PENALTY,
     ):
@@ -102,13 +117,16 @@ class PPSEnv(gym.Env):
 
         self.max_episode_ticks = max_episode_ticks
         self.use_heuristic_fallback = use_heuristic_fallback
+        self.reward_picked_qty_weight = reward_picked_qty_weight
         self.reward_alpha = reward_alpha
         self.reward_visit_penalty = reward_visit_penalty
 
         # ---- spaces (will be refined in reset once we know pod count) ----
         self.max_pods = MAX_PODS_OBS
-        # Per-pod feature: TOP_K_SKUS (sku qty) + 3 (dist to stations) + 3 (match degree)
-        self.pod_feature_dim = TOP_K_SKUS + NUM_STATIONS + NUM_STATIONS
+        # Per-pod feature: SKU qty + station distances + match degree + pod zone one-hot.
+        self.pod_feature_dim = (
+            TOP_K_SKUS + NUM_STATIONS + NUM_STATIONS + NUM_TRAFFIC_ZONES
+        )
         self.observation_space = spaces.Dict({
             "pod_features": spaces.Box(
                 low=0.0, high=1.0,
@@ -122,6 +140,11 @@ class PPSEnv(gym.Env):
             ),
             "num_candidates": spaces.Box(
                 low=0, high=self.max_pods, shape=(1,), dtype=np.int32,
+            ),
+            "zone_robot_counts": spaces.Box(
+                low=0.0, high=MAX_ZONE_ROBOT_COUNT,
+                shape=(NUM_TRAFFIC_ZONES,),
+                dtype=np.float32,
             ),
         })
         # Each pod picks one of 4 actions
@@ -304,6 +327,7 @@ class PPSEnv(gym.Env):
         Landscape.total_objects = 0
 
         warehouse = Inventory()
+        warehouse.tick_to_second = SIM_TICK_TO_SECOND
 
         # POA: Rika's Future-aware POA (no order batching)
         warehouse.poa_podmatch = False
@@ -436,6 +460,28 @@ class PPSEnv(gym.Env):
             future[sid] = fd
         return future
 
+    @staticmethod
+    def _get_traffic_zone_index(x: float, y: float) -> Optional[int]:
+        """Return zero-based traffic zone index for a coordinate, or None."""
+        for idx, ((min_x, max_x), (min_y, max_y)) in enumerate(TRAFFIC_ZONES):
+            if min_x <= x <= max_x and min_y <= y <= max_y:
+                return idx
+        return None
+
+    def _get_zone_robot_counts(self) -> np.ndarray:
+        counts = np.zeros(NUM_TRAFFIC_ZONES, dtype=np.float32)
+        wh = self._warehouse
+        if wh is None:
+            return counts
+
+        for obj in wh.get_movable_objects():
+            if getattr(obj, "object_type", None) != "robot":
+                continue
+            zone_idx = self._get_traffic_zone_index(obj.pos_x, obj.pos_y)
+            if zone_idx is not None:
+                counts[zone_idx] += 1.0
+        return counts
+
     def _build_observation(self) -> Dict[str, np.ndarray]:
         candidates = self._get_candidate_pods()
         station_pos = self._get_station_positions()
@@ -446,6 +492,7 @@ class PPSEnv(gym.Env):
         n = len(candidates)
         features = np.zeros((self.max_pods, self.pod_feature_dim), dtype=np.float32)
         station_feats = np.zeros((NUM_STATIONS, TOP_K_SKUS), dtype=np.float32)
+        zone_robot_counts = self._get_zone_robot_counts()
 
         for j, sid in enumerate(station_ids[:NUM_STATIONS]):
             fd = future_demands.get(sid, {})
@@ -485,10 +532,17 @@ class PPSEnv(gym.Env):
                     min(matched / max(total_demand, 1), 1.0)
                 )
 
+            # 4. Pod zone location as one-hot features.
+            zone_idx = self._get_traffic_zone_index(pod.pos_x, pod.pos_y)
+            if zone_idx is not None:
+                zone_offset = TOP_K_SKUS + NUM_STATIONS + NUM_STATIONS
+                features[i, zone_offset + zone_idx] = 1.0
+
         return {
             "pod_features": features,
             "station_features": station_feats,
             "num_candidates": np.array([n], dtype=np.int32),
+            "zone_robot_counts": zone_robot_counts,
         }
 
     # ------------------------------------------------------------------
@@ -641,8 +695,10 @@ class PPSEnv(gym.Env):
 
     def _compute_reward(self) -> float:
         """
-        Reward = picked_qty_delta - visit_penalty * pod_visits_delta
-                 - alpha * avg_completion_time_delta.
+        Reward = -alpha * avg_completion_time_delta.
+
+        Picked quantity and pod visits are still logged as metrics, but they do
+        not affect the reward after the traffic-aware PPS update.
         """
         picked_qty_delta = (
             self._episode_pile_on_items - self._prev_pile_on_items
@@ -672,11 +728,7 @@ class PPSEnv(gym.Env):
         self._prev_pile_on_visits = self._episode_pile_on_visits
         self._prev_completion_time = self._episode_total_completion_time
 
-        reward = (
-            picked_qty_delta
-            - self.reward_visit_penalty * pod_visits_delta
-            - self.reward_alpha * avg_ct_delta
-        )
+        reward = -self.reward_alpha * avg_ct_delta
         return float(reward)
 
     def _build_info(self) -> Dict[str, Any]:
@@ -699,6 +751,9 @@ class PPSEnv(gym.Env):
             "reward_avg_completion_time_delta": (
                 self._last_reward_avg_completion_time
             ),
+            "reward_picked_qty_weight": self.reward_picked_qty_weight,
+            "reward_visit_penalty": self.reward_visit_penalty,
+            "reward_alpha": self.reward_alpha,
             "cumulative_path_cost": self._episode_cumulative_path_cost,
             "throughput": self._episode_orders_completed,
             "tick": self._warehouse._tick if self._warehouse else 0,

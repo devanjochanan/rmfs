@@ -11,3 +11,7 @@ output
 saved_models
 robot_sa_data
 generated_*.csv
+.venv/
+.matplotlib/
+
+zipped all.zip

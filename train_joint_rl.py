@@ -27,6 +27,11 @@ import time
 from datetime import datetime
 from typing import Any, Dict
 
+# Keep Matplotlib/SB3 font-cache writes inside the project folder on Windows.
+_MPLCONFIGDIR = os.path.join(os.path.dirname(__file__), ".matplotlib")
+os.makedirs(_MPLCONFIGDIR, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", _MPLCONFIGDIR)
+
 import numpy as np
 
 from stable_baselines3 import PPO
