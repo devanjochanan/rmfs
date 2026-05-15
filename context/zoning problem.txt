@@ -79,3 +79,4 @@ and i want you to add this input to the zoning features:
 
 also, i want the reward to be only minimizing avg_completion_time, and you can deactivate the rest
 after you implemented all of it, please make the change log in the change logs folder and you can see the other txt files in that folder for the example
+

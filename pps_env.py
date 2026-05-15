@@ -21,6 +21,10 @@ Observation:
         - Robot count in each of the 5 traffic zones
 Reward:
     negative average completion time for newly completed orders
+
+During training, pod SKU allocation is regenerated every episode by default.
+The regenerated allocation still uses the ABC SKU class distribution from the
+existing PodGenerator settings, while the physical layout stays fixed.
 """
 
 from __future__ import annotations
@@ -57,6 +61,10 @@ ALPHA_OCT = 1.0            # weight for order-completion-time penalty in reward
 POD_VISIT_PENALTY = 0.0    # kept for CLI compatibility; inactive in reward
 MAX_PODS_OBS = 60          # max pods we observe at once (padded if fewer)
 SIM_TICK_TO_SECOND = 0.15  # keep PPSEnv timing aligned with NetLogo
+RANDOMIZE_POD_SKUS_EACH_EPISODE = (
+    os.environ.get("PPS_RANDOMIZE_PODS_EACH_EPISODE", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
 NUM_TRAFFIC_ZONES = 5
 MAX_ZONE_ROBOT_COUNT = 100.0
 TRAFFIC_ZONES = (
@@ -295,6 +303,13 @@ class PPSEnv(gym.Env):
             sim_ver=2,
             dev_mode=True,
         )
+
+        # Regenerate pod-SKU allocation each training episode while keeping
+        # the same ABC class distribution configured in netlogo.assign_skus_to_pods().
+        if RANDOMIZE_POD_SKUS_EACH_EPISODE:
+            for f in ["pods.csv", "skus_data.csv", "sorted_skus_data.csv"]:
+                if os.path.exists(f):
+                    os.remove(f)
 
         # Remove stale CSVs
         if os.path.exists("assign_order.csv"):

@@ -1,0 +1,26 @@
+PPS RL
+WINDOW 1 (Tensorboard)
+source venv/bin/activate
+python -m tensorboard.main --logdir "./saved_models/runs"
+
+WINDOW 2A (Start train)
+source venv/bin/activate
+python train_pps_rl.py --episodes 500 --save-path saved_models/pps_rl.pt --max-ticks 3000
+
+WINDOW 2B (Continue train)
+source venv/bin/activate
+python train_pps_rl.py --resume --episodes 5000 --save-path saved_models/pps_rl.pt --max-ticks 3000
+
+
+JOINT
+WINDOW 1 (Tensorboard)
+source venv/bin/activate
+python -m tensorboard.main --logdir "./saved_models/joint_runs"
+
+WINDOW 2A (Start train)
+source venv/bin/activate
+python train_joint_rl.py --episodes 500 --max-ticks 3000
+
+WINDOW 2B (Continue train)
+source venv/bin/activate
+python train_joint_rl.py --resume --episodes 10000 --max-ticks 3000

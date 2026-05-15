@@ -3,6 +3,7 @@ import csv
 import os
 import math
 import threading
+import re
 from collections import defaultdict, deque
 import ast
 import json
@@ -112,6 +113,24 @@ class Inventory(Universe):
             initialize_pre_assign_table(timestamp)
             clear_pre_assign_table()
         super().__init__()
+
+    @staticmethod
+    def _normalize_sku_qty_dict(sku_qty):
+        if not isinstance(sku_qty, dict):
+            return {}
+
+        normalized = {}
+        for sku, qty in sku_qty.items():
+            try:
+                sku_key = int(sku)
+            except (TypeError, ValueError):
+                sku_key = sku
+            try:
+                qty_value = int(qty)
+            except (TypeError, ValueError):
+                qty_value = qty
+            normalized[sku_key] = qty_value
+        return normalized
 
     def addObject(self, object):
         if object.object_type == "robot":
@@ -1225,7 +1244,7 @@ class Inventory(Universe):
                 df_dicts.append({
                     "station_id": station_id,
                     "order_id": order_id,
-                    "unpicked_skus": str(unpicked_skus),
+                    "unpicked_skus": self._normalize_sku_qty_dict(unpicked_skus),
                     # "robot_inside_station": self.robot_queue_order[station_id],
                     "pod_1": first_queue,
                     "pod_2": second_queue,
@@ -1334,7 +1353,7 @@ class Inventory(Universe):
                 df_dicts.append({
                     "station_id": station_id,
                     "order_id": order_id,
-                    "unpicked_skus": str(unpicked_skus),
+                    "unpicked_skus": self._normalize_sku_qty_dict(unpicked_skus),
                     # "robot_inside_station": self.robot_queue_order[station_id],
                     "pod_1": first_queue,
                     "pod_2": second_queue,
@@ -1352,6 +1371,32 @@ class Inventory(Universe):
         return df
 
     def forcast_next_bin_avail(self, df):
+        def parse_sku_qty_dict(value):
+            if isinstance(value, dict):
+                return self._normalize_sku_qty_dict(value)
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                return {}
+            if isinstance(value, str):
+                try:
+                    return self._normalize_sku_qty_dict(ast.literal_eval(value))
+                except (ValueError, SyntaxError):
+                    cleaned = re.sub(
+                        r"(?:np\.)?(?:int64|int32|int16|int8)\((-?\d+)\)",
+                        r"\1",
+                        value,
+                    )
+                    cleaned = re.sub(
+                        r"(?:np\.)?(?:float64|float32)\((-?\d+(?:\.\d+)?)\)",
+                        r"\1",
+                        cleaned,
+                    )
+                    try:
+                        return self._normalize_sku_qty_dict(ast.literal_eval(cleaned))
+                    except (ValueError, SyntaxError):
+                        print(f"[WARN] Could not parse unpicked_skus value: {value}")
+                        return {}
+            return {}
+
         def is_fulfilled(row):
             required = row['unpicked_skus']
             # Flatten all occupied bins into a list
@@ -1371,7 +1416,7 @@ class Inventory(Universe):
                 if available[sku] < req_qty:
                     return False
             return True
-        df['unpicked_skus'] = df['unpicked_skus'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+        df['unpicked_skus'] = df['unpicked_skus'].apply(parse_sku_qty_dict)
         df['next_bin_avail'] = df.apply(is_fulfilled, axis=1)
         return df
     
