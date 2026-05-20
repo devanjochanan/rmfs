@@ -1700,7 +1700,9 @@ class Inventory(Universe):
             exclude_indices.update(q)
         fulfilment_fs = fulfilment_fs[~fulfilment_fs.index.isin(exclude_indices)]
 
-        order_candidates = fulfilment_fs[current_picker].sort_values(ascending=False).head(empty_bins[current_picker]*3)
+        order_candidates = fulfilment_fs[current_picker].sort_values(
+            ascending=False
+        )
         # print("### ORDER CANDIDATES")
         # print(order_candidates)
 
@@ -1727,6 +1729,7 @@ class Inventory(Universe):
             print(f"next_bin_counts {next_bin_counts}")
             # raise AssertionError(f"there is next_bin_counts current picker {current_picker} next_bin_counts {next_bin_counts}")
             fulfilment_f3 = self.get_fulfilment_table(mode="F3")
+            diverted_indices = set()
             for idx, val in order_candidates.items():
                 best_picker = fulfilment_f3.loc[idx].idxmax()
                 best_value = fulfilment_f3.loc[idx].max()
@@ -1755,6 +1758,7 @@ class Inventory(Universe):
                         )
                     self.preassign_per_station[best_picker].append(idx)
                     next_bin_counts[best_picker] -= 1
+                    diverted_indices.add(idx)
                     # raise AssertionError
                 else:
                     order_ids.append(idx)
@@ -1763,8 +1767,20 @@ class Inventory(Universe):
                     # process
                     self.yyy(current_picker, order_ids)
                     return
-            print(f"")
-            raise AssertionError("WHAT???")
+
+            # Fallback: if future-bin preassignment consumed too many candidate
+            # orders, fill the current picker with remaining unassigned orders
+            # instead of crashing the simulation.
+            for idx, _val in order_candidates.items():
+                if len(order_ids) >= total_order_ids:
+                    break
+                if idx in diverted_indices or idx in order_ids:
+                    continue
+                order_ids.append(idx)
+
+            if order_ids:
+                self.yyy(current_picker, order_ids[:total_order_ids])
+            return
 
     def yyy(self, station_id, order_ids):
         self.put_order_to_picking_station({station_id: order_ids})

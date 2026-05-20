@@ -1,0 +1,20 @@
+Commit first
+From the PC, use the correct repo folder:
+cd ~/Documents/rmfs-latest
+
+Then run:
+git status
+
+If it shows files you changed, commit and push:
+git add .
+git commit -m "Update RMFS simulation"
+git push origin tugas-akhir
+
+That’s the main flow.
+If you already committed in VS Code, then just run:
+git push origin tugas-akhir
+
+After pushing, check:
+git status
+
+Do not commit big files like .zip, venv/, or huge training outputs over 100 MB, because GitHub may reject them again.

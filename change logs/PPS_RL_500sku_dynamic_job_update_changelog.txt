@@ -38,6 +38,8 @@ Dynamic robot-job update:
 - Duplicate order/SKU assignment inside the same job is guarded by tracking existing (order_id, sku) pairs.
 - Active robot jobs are updated after robot movement and before finish_task_in_job() is allowed to complete the job.
 - Queued jobs are also checked before robot assignment, so a pod job waiting for a robot can absorb compatible newly assigned orders.
+- Made Rika's POA pre-assignment path more robust by removing the hard AssertionError("WHAT???") fallback in xxx().
+  If future-bin preassignment consumes too many candidate orders, the current picker now assigns whatever valid current-picker orders remain instead of crashing training.
 
 Reason:
 - The previous 50-SKU observation could hide many SKU identities from PPO, especially because the system has 500 SKU types.
