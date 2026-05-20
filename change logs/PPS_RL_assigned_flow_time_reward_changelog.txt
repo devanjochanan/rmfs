@@ -1,0 +1,60 @@
+PPS RL assigned-order flow-time reward changelog
+Date: 2026-05-18
+
+Files changed:
+- pps_env.py
+- train_pps_rl.py
+
+What changed:
+- Replaced the PPS RL reward from average completion-time delta to assigned-order flow-time cost delta.
+- The reward now uses the current completion-time definition: time starts when an order is assigned to a picker/workstation.
+- Completed assigned orders contribute their final processing time.
+- Unfinished assigned orders contribute their current age, so orders that remain waiting are still penalized.
+
+New flow-time cost:
+completed_orders_time_sum =
+    sum(order_complete_time - process_start_time for completed assigned orders)
+
+unfinished_orders_age_sum =
+    sum(current_time - process_start_time for unfinished assigned orders)
+
+total_flow_time_cost =
+    completed_orders_time_sum + unfinished_orders_age_sum
+
+New step reward:
+reward_t =
+    -reward_alpha * (total_flow_time_cost_t - total_flow_time_cost_t-1)
+
+TensorBoard changes:
+- pps_reward now logs only:
+  total_reward
+  total_flow_time_cost
+  completed_orders_time_sum
+- pile_on_rate remains under pps_metrics.
+- picked_quantity and pod_visits are not logged under pps_reward.
+
+CSV metrics changes:
+- Added total_flow_time_cost.
+- Added completed_orders_time_sum.
+- Added unfinished_orders_age_sum.
+- Added reward_flow_time_cost_delta.
+
+Reason:
+- The previous average completion-time delta only produced reward when orders completed.
+- That made the reward sparse and allowed unfinished assigned orders to avoid direct time penalty until completion.
+- The new flow-time cost keeps the reward measured in time while penalizing unfinished assigned orders as they wait.
+
+Performance note:
+- Flow-time cost metrics are now refreshed once at each PPS decision boundary instead of on every internal warehouse tick.
+- This keeps the reward semantics the same while reducing repeated full-order scans during simulation advancement.
+- Added RMFS_FAST_TRAIN mode for PPO training.
+- When RMFS_FAST_TRAIN=1, reporting-only CSV/SQLite writes are skipped or kept in memory:
+  job_task, order_history, pod_travel, pre_assign, pod_info.csv, and order-finished.csv.
+- assign_order.csv and pod_location remain active in fast training because they are used by the simulation as state, not only as reporting.
+- Order generation, pod-SKU randomization, POA/PPS logic, robot movement, and reward calculation remain active.
+- Fixed a fast-training crash where a completed order with a missing station_id could raise KeyError: None during station removal.
+- The finish handler now falls back to the pod job's station_id, and PPS job creation ensures picked orders carry the assigned station_id.
+
+Important note:
+- This reward does not include time before an order is assigned to a workstation.
+- Throughput and unassigned/backlog behavior should still be monitored separately during evaluation.

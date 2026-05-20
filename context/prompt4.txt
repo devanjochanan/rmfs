@@ -1,0 +1,118 @@
+okay i have an idea.
+i want the reward to be sum of all generated order's total time from the orders are generated, until it is completed
+this way, orders that take longer time to process will be processed and the RL will process all orders
+first things first do you have any concerns regarding this?
+
+how about the reward is sum of all unfinished generated order's total time from the orders are generated until that point?
+Yes, that is a much better direction. What you are describing is a flow-time holding cost:
+
+For every generated order that is not finished yet:
+unfinished_order_age = current_time - order_generated_time
+
+unfinished_age_sum = sum(unfinished_order_age for all unfinished generated orders)
+This directly punishes orders that are waiting too long. So the RL cannot easily ignore hard/long orders, because their age keeps increasing.
+
+But I would make one important adjustment:
+
+Do not use the full current sum directly as reward every step:
+
+reward = -unfinished_age_sum
+because then the same waiting time gets counted again and again depending on how many PPO decisions happen.
+
+Better:
+
+reward = -(current_total_flow_cost - previous_total_flow_cost)
+Where:
+
+total_flow_cost =
+    sum(completion_time - generated_time for completed orders)
+    +
+    sum(current_time - generated_time for unfinished orders)
+This is very good because it includes both:
+
+completed orders -> their final flow time
+unfinished orders -> their current waiting age
+Example:
+
+At time 100:
+
+Order A generated at 0, unfinished -> age 100
+Order B generated at 50, unfinished -> age 50
+
+total_flow_cost = 150
+At time 120:
+
+Order A completed at 110 -> flow time 110
+Order B still unfinished -> age 70
+
+total_flow_cost = 110 + 70 = 180
+Reward between those PPO decisions:
+
+reward = -(180 - 150)
+reward = -30
+That 30 means:
+
+Order A waited 10 more seconds
+Order B waited 20 more seconds
+total new waiting cost = 30 seconds
+This is exactly the kind of reward you want.
+
+For your thesis, I would define it like this:
+
+Reward objective:
+Minimize generated-order flow time.
+
+At each PPS decision:
+flow_time_cost_t =
+    completed_order_flow_time_sum
+    +
+    unfinished_order_age_sum
+
+reward_t =
+    -(flow_time_cost_t - flow_time_cost_t-1)
+This keeps the reward time-based, and it naturally pushes PPO to finish old/hard orders because unfinished orders keep accumulating penalty.
+
+One more thing: because episodes may end at 3000 ticks with unfinished orders, I would still add a terminal penalty:
+
+terminal_penalty =
+    unfinished_orders_at_end * baseline_avg_completion_time
+So final objective becomes:
+
+total_flow_cost =
+    completed_flow_time_sum
+    + unfinished_age_sum
+    + terminal_unfinished_penalty
+This prevents PPO from thinking, “I can leave hard orders unfinished at the end.”
+
+So my recommendation is: yes, use this idea, but use the delta of total flow cost between PPO steps, not the raw unfinished sum every time. This is probably the most defensible reward you have proposed so far.
+
+===============================================================================================================================================================================================================================
+
+so my plan is now im stil sticking to the current order completion time (from orders are assigned to a workstation until it is completed.)
+please make the reward like this:
+
+completed_orders_time_sum = sum(completion_time - order_to_station_assigned_time for completed orders)
+unfinished_orders_age_sum = sum(current_time - order_to_station_assigned_time for unfinished orders)
+
+total_flow_time_cost =
+    completed_orders_time_sum
+    + unfinished_orders_age_sum
+
+Reward objective:
+Minimize generated-order flow time.
+
+At each PPS decision:
+flow_time_cost_t =
+    completed_orders_time_sum
+    + unfinished_orders_age_sum
+
+reward_t =
+    -(flow_time_cost_t - flow_time_cost_t-1)
+
+in the tensor board, i want to change a few whings:
+in the pps_reward, i want it to be only:
+-total_reward
+-total_flow_time_cost
+-completed_orders_time_sum
+
+do you have any concerns?

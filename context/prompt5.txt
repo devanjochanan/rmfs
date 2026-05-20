@@ -1,0 +1,36 @@
+okay now i want to change several things:
+- i want you to lower the ent coef in to 0.001
+- i want you to activate update_robot_job_for_new_orders(self, job), here are the steps and concerns:
+1. Reactivate update_robot_job_for_new_orders()
+Remove the early return.
+
+FIRST THINGS FIRS FOR ALL THE STEPS AND CONCERNS BELOW, please add it in the update_robot_job_for_new_orders so i can turn it on and off
+2. Only update valid jobs
+The job should only be updated if:
+pod is going to a picker station
+job is not finished
+pod still has available SKU quantity
+station has newly assigned orders with uncommitted demand
+
+3. Add Order B’s SKU demand into Pod F/G’s existing job
+If Order B is assigned to the same station and still needs SKU X, and Pod F/G has SKU X, then:
+order.commit_quantity(...)
+job.add_picking_task(order_B, sku_X, qty)
+pod.pick_sku(...)
+station.reduce_sku_from_station(...)
+Then when the pod arrives, finish_picking_task() will deliver to both Order A and Order B because job.orders now contains both.
+
+4. Call the update before the job is finished
+This is important. Currently the tick flow can finish a job before updating it. Better logic is:
+robot moves
+update existing job with new station orders
+if picking_delay == 0:
+    finish job
+
+5.Avoid duplicate assignment
+This is already mostly handled by:
+order.get_remaining_skus()
+because committed quantity is subtracted. But we should still be careful not to add the same order/SKU twice.
+
+-i want you to expand the top 50 SKU quantity observation to all 500 sku types quantity
+-after this, make another changelog about all of the changes

@@ -10,7 +10,7 @@ Actions (per pod):
     3 = assign to picker-3
 Observation:
     Per pod:
-        - SKU quantity vector over Top-K SKUs
+        - SKU quantity vector over all configured SKU types
         - Manhattan distance to each station
         - Match degree with each station's demand
         - One-hot traffic zone where the pod is located
@@ -20,7 +20,8 @@ Observation:
     Global traffic:
         - Robot count in each of the 5 traffic zones
 Reward:
-    negative average completion time for newly completed orders
+    negative assigned-order flow-time cost delta:
+    completed order time sum + unfinished assigned order age sum
 
 During training, pod SKU allocation is regenerated every episode by default.
 The regenerated allocation still uses the ABC SKU class distribution from the
@@ -55,7 +56,7 @@ from model.tools.job_task import upsert_job_task
 # ---------------------------------------------------------------------------
 NUM_STATIONS = 3           # picker-0, picker-1, picker-2
 NUM_ACTIONS = NUM_STATIONS + 1   # 0=unassigned, 1..3=station
-TOP_K_SKUS = 50           # dimensionality of SKU feature vector per pod
+TOP_K_SKUS = 500          # dimensionality of SKU feature vector per pod
 PICKED_QTY_WEIGHT = 0.0    # kept for CLI compatibility; inactive in reward
 ALPHA_OCT = 1.0            # weight for order-completion-time penalty in reward
 POD_VISIT_PENALTY = 0.0    # kept for CLI compatibility; inactive in reward
@@ -64,6 +65,10 @@ SIM_TICK_TO_SECOND = 0.15  # keep PPSEnv timing aligned with NetLogo
 RANDOMIZE_POD_SKUS_EACH_EPISODE = (
     os.environ.get("PPS_RANDOMIZE_PODS_EACH_EPISODE", "1").strip().lower()
     not in {"0", "false", "no", "off"}
+)
+FAST_TRAIN_MODE = (
+    os.environ.get("RMFS_FAST_TRAIN", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
 )
 NUM_TRAFFIC_ZONES = 5
 MAX_ZONE_ROBOT_COUNT = 100.0
@@ -96,6 +101,55 @@ def _silent_sim():
         yield
     finally:
         sys.stdout = saved
+
+
+def _noop(*args, **kwargs):
+    return None
+
+
+def _activate_fast_training_io():
+    """Disable reporting-only CSV/SQLite hooks during PPO training."""
+    global upsert_job_task
+
+    upsert_job_task = _noop
+
+    import model.inventory as inventory_module
+    import model.robot as robot_module
+    import model.robot_job as robot_job_module
+    import model.tools.job_task as job_task_module
+    import model.tools.order_history as order_history_module
+    import model.tools.pod_travel as pod_travel_module
+    import model.tools.pre_assign as pre_assign_module
+
+    inventory_module.upsert_order_history = _noop
+    inventory_module.upsert_job_task = _noop
+    inventory_module.update_job_task = _noop
+    inventory_module.initialize_pre_assign_table = _noop
+    inventory_module.clear_pre_assign_table = _noop
+    inventory_module.insert_pre_assign = _noop
+
+    robot_module.upsert_pod_travel = _noop
+
+    job_task_module.initialize_job_task_table = _noop
+    job_task_module.clear_job_task_table = _noop
+    job_task_module.upsert_job_task = _noop
+    job_task_module.update_job_task = _noop
+
+    order_history_module.initialize_order_history_table = _noop
+    order_history_module.clear_order_history = _noop
+    order_history_module.upsert_order_history = _noop
+
+    pod_travel_module.initialize_pod_travel_table = _noop
+    pod_travel_module.clear_pod_travel = _noop
+    pod_travel_module.upsert_pod_travel = _noop
+
+    pre_assign_module.initialize_pre_assign_table = _noop
+    pre_assign_module.clear_pre_assign_table = _noop
+    pre_assign_module.insert_pre_assign = _noop
+
+
+if FAST_TRAIN_MODE:
+    _activate_fast_training_io()
 
 
 class PPSEnv(gym.Env):
@@ -160,9 +214,12 @@ class PPSEnv(gym.Env):
 
         # Internal state
         self._warehouse: Optional[Inventory] = None
-        self._sku_index: Dict[str, int] = {}  # sku_id -> index in TOP_K vector
+        self._sku_index: Dict[str, int] = {}  # sku_id -> stable feature index
         self._episode_orders_completed: int = 0
         self._episode_total_completion_time: float = 0.0
+        self._episode_completed_orders_time_sum: float = 0.0
+        self._episode_unfinished_orders_age_sum: float = 0.0
+        self._episode_total_flow_time_cost: float = 0.0
         self._episode_pile_on_items: int = 0
         self._episode_pile_on_visits: int = 0
         self._episode_cumulative_path_cost: float = 0.0
@@ -170,9 +227,11 @@ class PPSEnv(gym.Env):
         self._prev_pile_on_items: int = 0
         self._prev_pile_on_visits: int = 0
         self._prev_completion_time: float = 0.0
+        self._prev_flow_time_cost: float = 0.0
         self._last_reward_picked_qty: float = 0.0
         self._last_reward_pod_visits: float = 0.0
         self._last_reward_avg_completion_time: float = 0.0
+        self._last_reward_flow_time_cost_delta: float = 0.0
         self._step_count: int = 0
 
     # ------------------------------------------------------------------
@@ -196,6 +255,9 @@ class PPSEnv(gym.Env):
             # Reset episode metrics
             self._episode_orders_completed = 0
             self._episode_total_completion_time = 0.0
+            self._episode_completed_orders_time_sum = 0.0
+            self._episode_unfinished_orders_age_sum = 0.0
+            self._episode_total_flow_time_cost = 0.0
             self._episode_pile_on_items = 0
             self._episode_pile_on_visits = 0
             self._episode_cumulative_path_cost = 0.0
@@ -203,13 +265,16 @@ class PPSEnv(gym.Env):
             self._prev_pile_on_items = 0
             self._prev_pile_on_visits = 0
             self._prev_completion_time = 0.0
+            self._prev_flow_time_cost = 0.0
             self._last_reward_picked_qty = 0.0
             self._last_reward_pod_visits = 0.0
             self._last_reward_avg_completion_time = 0.0
+            self._last_reward_flow_time_cost_delta = 0.0
             self._step_count = 0
 
             # Advance simulation until first PPS decision point
             self._advance_to_next_pps_point()
+            self._prev_flow_time_cost = self._episode_total_flow_time_cost
 
             obs = self._build_observation()
             info = self._build_info()
@@ -314,10 +379,11 @@ class PPSEnv(gym.Env):
         # Remove stale CSVs
         if os.path.exists("assign_order.csv"):
             os.remove("assign_order.csv")
-        # Recreate pod_info.csv with headers (finish_picking_task reads it)
-        import pandas as pd
-        pd.DataFrame(columns=["pod_id", "item_id", "qty", "order_id", "processed_time", "task_type"])\
-            .to_csv("pod_info.csv", index=False)
+        if not FAST_TRAIN_MODE:
+            # Recreate pod_info.csv with headers (finish_picking_task reads it)
+            import pandas as pd
+            pd.DataFrame(columns=["pod_id", "item_id", "qty", "order_id", "processed_time", "task_type"])\
+                .to_csv("pod_info.csv", index=False)
 
         # Reset class-level mutable state that persists across instances
         # (Universe, Inventory, Landscape all use class-level lists/dicts)
@@ -342,6 +408,7 @@ class PPSEnv(gym.Env):
         Landscape.total_objects = 0
 
         warehouse = Inventory()
+        warehouse.fast_train = FAST_TRAIN_MODE
         warehouse.tick_to_second = SIM_TICK_TO_SECOND
 
         # POA: Rika's Future-aware POA (no order batching)
@@ -364,16 +431,36 @@ class PPSEnv(gym.Env):
     # SKU index for feature encoding
     # ------------------------------------------------------------------
     def _build_sku_index(self):
-        """Build mapping of top-K most common SKUs to vector indices."""
-        sku_counts = {}
-        for pod in self._warehouse.pod_manager.pods:
-            for sku, details in pod.skus.items():
-                sku_counts[sku] = sku_counts.get(sku, 0) + details["current_qty"]
-        # Sort by total qty descending, take top K
-        sorted_skus = sorted(sku_counts.items(), key=lambda x: x[1], reverse=True)
-        self._sku_index = {
-            sku: i for i, (sku, _) in enumerate(sorted_skus[:TOP_K_SKUS])
-        }
+        """Build a stable SKU-id-to-feature-index mapping.
+
+        The previous top-K mapping sorted SKUs by current pod quantity. That is
+        acceptable for a small feature sample, but with all SKU features each
+        column should represent the same SKU across episodes and in NetLogo.
+        """
+        sku_ids = []
+        for csv_file, column in (("items.csv", "item_id"), ("skus_data.csv", "item_id")):
+            if not os.path.exists(csv_file):
+                continue
+            try:
+                import pandas as pd
+                df = pd.read_csv(csv_file, usecols=[column])
+                sku_ids = sorted(df[column].dropna().astype(int).unique().tolist())
+                if sku_ids:
+                    break
+            except Exception:
+                sku_ids = []
+
+        if not sku_ids:
+            sku_set = set()
+            for pod in self._warehouse.pod_manager.pods:
+                for sku in pod.skus.keys():
+                    try:
+                        sku_set.add(int(sku))
+                    except (TypeError, ValueError):
+                        sku_set.add(sku)
+            sku_ids = sorted(sku_set)
+
+        self._sku_index = {sku: i for i, sku in enumerate(sku_ids[:TOP_K_SKUS])}
 
     # ------------------------------------------------------------------
     # Observation building
@@ -645,31 +732,29 @@ class PPSEnv(gym.Env):
         wh = self._warehouse
         max_idle_ticks = 200  # safety: don't spin forever
 
+        def finish_step(terminated: bool, truncated: bool) -> Tuple[bool, bool]:
+            self._update_episode_metrics()
+            self._episode_cumulative_path_cost = wh.total_energy
+            return terminated, truncated
+
         for _ in range(max_idle_ticks):
             if wh._tick >= self.max_episode_ticks:
-                return False, True  # truncated
+                return finish_step(False, True)  # truncated
 
             # Check if all orders done
             total_orders = len(wh.order_manager.orders)
-            finished = total_orders - len(wh.order_manager.unfinished_orders)
             if total_orders > 0 and len(wh.order_manager.unfinished_orders) == 0:
-                return True, False  # terminated (all orders done)
+                return finish_step(True, False)  # terminated (all orders done)
 
             # Run one tick of simulation
             wh.tick()
 
-            # Track metrics from completed orders
-            self._update_episode_metrics()
-
-            # Track cumulative path cost (robot energy)
-            self._episode_cumulative_path_cost = wh.total_energy
-
             # Check if PPS decision is needed
             if self._pps_decision_needed():
-                return False, False
+                return finish_step(False, False)
 
         # If we spun too long, just return
-        return False, False
+        return finish_step(False, False)
 
     def _pps_decision_needed(self) -> bool:
         """Check if any station has unfulfilled demand and idle pods exist."""
@@ -701,19 +786,37 @@ class PPSEnv(gym.Env):
         )
         self._episode_orders_completed = finished_count
 
-        # Sum completion times from finished orders
-        total_ct = 0.0
+        completed_orders_time_sum = 0.0
         for order in wh.order_manager.orders:
             if order.order_complete_time > 0 and order.process_start_time > 0:
-                total_ct += order.order_complete_time - order.process_start_time
-        self._episode_total_completion_time = total_ct
+                completed_orders_time_sum += (
+                    order.order_complete_time - order.process_start_time
+                )
+
+        unfinished_orders_age_sum = 0.0
+        current_time = int(wh._tick)
+        for order in wh.order_manager.unfinished_orders:
+            if order.process_start_time > 0:
+                unfinished_orders_age_sum += max(
+                    current_time - order.process_start_time,
+                    0.0,
+                )
+
+        self._episode_completed_orders_time_sum = float(completed_orders_time_sum)
+        self._episode_unfinished_orders_age_sum = float(unfinished_orders_age_sum)
+        self._episode_total_completion_time = float(completed_orders_time_sum)
+        self._episode_total_flow_time_cost = float(
+            completed_orders_time_sum + unfinished_orders_age_sum
+        )
 
     def _compute_reward(self) -> float:
         """
-        Reward = -alpha * avg_completion_time_delta.
+        Reward = -alpha * assigned-order flow-time cost delta.
 
-        Picked quantity and pod visits are still logged as metrics, but they do
-        not affect the reward after the traffic-aware PPS update.
+        Flow-time cost uses the current order completion-time definition:
+        order time starts when the order is assigned to a workstation/picker.
+        Completed orders contribute their final processing time, while
+        unfinished assigned orders contribute their current age.
         """
         picked_qty_delta = (
             self._episode_pile_on_items - self._prev_pile_on_items
@@ -721,29 +824,23 @@ class PPSEnv(gym.Env):
         pod_visits_delta = (
             self._episode_pile_on_visits - self._prev_pile_on_visits
         )
-
-        new_completed = (
-            self._episode_orders_completed - self._prev_orders_completed
+        flow_time_cost_delta = (
+            self._episode_total_flow_time_cost - self._prev_flow_time_cost
         )
-        ct_delta = (
-            self._episode_total_completion_time - self._prev_completion_time
-        )
-        if new_completed > 0:
-            avg_ct_delta = ct_delta / new_completed
-        else:
-            avg_ct_delta = 0.0
 
         self._last_reward_picked_qty = float(picked_qty_delta)
         self._last_reward_pod_visits = float(pod_visits_delta)
-        self._last_reward_avg_completion_time = float(avg_ct_delta)
+        self._last_reward_avg_completion_time = 0.0
+        self._last_reward_flow_time_cost_delta = float(flow_time_cost_delta)
 
         # Update prev
         self._prev_orders_completed = self._episode_orders_completed
         self._prev_pile_on_items = self._episode_pile_on_items
         self._prev_pile_on_visits = self._episode_pile_on_visits
         self._prev_completion_time = self._episode_total_completion_time
+        self._prev_flow_time_cost = self._episode_total_flow_time_cost
 
-        reward = -self.reward_alpha * avg_ct_delta
+        reward = -self.reward_alpha * flow_time_cost_delta
         return float(reward)
 
     def _build_info(self) -> Dict[str, Any]:
@@ -757,6 +854,9 @@ class PPSEnv(gym.Env):
         return {
             "orders_completed": self._episode_orders_completed,
             "avg_order_completion_time": avg_ct,
+            "completed_orders_time_sum": self._episode_completed_orders_time_sum,
+            "unfinished_orders_age_sum": self._episode_unfinished_orders_age_sum,
+            "total_flow_time_cost": self._episode_total_flow_time_cost,
             "pile_on_rate": pile_on,
             "pile_on_items": self._episode_pile_on_items,
             "picked_quantity": self._episode_pile_on_items,
@@ -766,6 +866,7 @@ class PPSEnv(gym.Env):
             "reward_avg_completion_time_delta": (
                 self._last_reward_avg_completion_time
             ),
+            "reward_flow_time_cost_delta": self._last_reward_flow_time_cost_delta,
             "reward_picked_qty_weight": self.reward_picked_qty_weight,
             "reward_visit_penalty": self.reward_visit_penalty,
             "reward_alpha": self.reward_alpha,

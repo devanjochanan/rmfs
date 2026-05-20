@@ -57,6 +57,16 @@ class Inventory(Universe):
         # self.ignored_types = ["pod", "station", "way-direction"]
         self.ignored_types = ["station", "way-direction"]
         self.tick_to_second = 0.25
+        self.fast_train = (
+            os.environ.get("RMFS_FAST_TRAIN", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.dynamic_job_update_enabled = (
+            os.environ.get("RMFS_DYNAMIC_JOB_UPDATE", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
+        self._fast_pod_info_records = []
+        self._fast_finished_orders = []
         self.job_queue: list[RobotJob] = []
         # Instance-level mutable state (prevents cross-instance contamination)
         self.map = []
@@ -108,7 +118,7 @@ class Inventory(Universe):
         self._aisyahna_last_batch_tick = 0  # last tick the batching fired
 
 
-        if self.poa_second:
+        if self.poa_second and not self.fast_train:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M")
             initialize_pre_assign_table(timestamp)
             clear_pre_assign_table()
@@ -165,6 +175,9 @@ class Inventory(Universe):
             if self.update_intersection_using_RL:
                 self.intersection_manager.update_allowed_direction_using_q_model(int(self._tick))
 
+        for queued_job in list(self.job_queue):
+            self.update_robot_job_for_new_orders(queued_job)
+
         print(f"Current job queue length: {len(self.job_queue)}")
 
         if len(self.job_queue) > 0:
@@ -185,14 +198,15 @@ class Inventory(Universe):
                     self.job_queue.remove(job)  # Remove the selected job from the queue
                     print(f"Assigning job {job.pod}-{job.station_id} to robot {nearest_robot._id}")
                     nearest_robot.assign_job_and_set_move_to_take_pod(job)
-                    for triplet in job.orders:
-                        upsert_job_task(
-                            pod_id=str(job.pod.pod_id),
-                            order_id=str(triplet[0]),
-                            sku=str(triplet[1]),
-                            qty=str(triplet[2]),
-                            status="otw",
-                        )
+                    if not self.fast_train:
+                        for triplet in job.orders:
+                            upsert_job_task(
+                                pod_id=str(job.pod.pod_id),
+                                order_id=str(triplet[0]),
+                                sku=str(triplet[1]),
+                                qty=str(triplet[2]),
+                                status="otw",
+                            )
             
 
         # Update object positions and collect metrics
@@ -209,18 +223,24 @@ class Inventory(Universe):
                 if o.velocity == 0 and initial_velocity > 0:
                     self.stop_and_go += 1
 
+                # Add newly assigned compatible orders to active pod jobs before
+                # deciding whether the pod has finished station processing.
+                if o.job is not None and not o.job.is_finished:
+                    self.update_robot_job_for_new_orders(o.job)
+
                 # Handle job completion and replenishment
                 if o.job is not None and o.job.picking_delay == 0 and not o.job.is_finished:
                     need_replenish_pod = self.finish_task_in_job(o.job)
-                    for triplet in o.job.orders:
-                        update_job_task(
-                            pod_id=str(o.job.pod.pod_id),
-                            order_id=str(triplet[0]),
-                            sku=str(triplet[1]),
-                            qty=str(triplet[2]),
-                            status="finish",
-                            finish_time=self._tick
-                        )
+                    if not self.fast_train:
+                        for triplet in o.job.orders:
+                            update_job_task(
+                                pod_id=str(o.job.pod.pod_id),
+                                order_id=str(triplet[0]),
+                                sku=str(triplet[1]),
+                                qty=str(triplet[2]),
+                                status="finish",
+                                finish_time=self._tick
+                            )
                     if need_replenish_pod:
                         # pod: Pod = self.pod_manager.get_pod_by_coordinate(o.job.pod_coordinate.x, o.job.pod_coordinate.y)
                         pod: Pod = self.pod_manager.get_pod_by_id(o.job.pod.pod_id)
@@ -240,11 +260,6 @@ class Inventory(Universe):
                     self.pod_manager.mark_pod_available(o.job.pod)
                     o.job = None
                 
-                # Modify job if a new order is assign while pod is on the way
-                # TODO:
-                if o.job is not None:
-                    self.update_robot_job_for_new_orders(o.job)
-
         # Update global metrics
         self.total_robot_idle = total_idle
         self.total_energy = total_energy
@@ -285,7 +300,8 @@ class Inventory(Universe):
     def finish_picking_task(self, job: RobotJob):
         # pod: Pod = self.pod_manager.get_pod_by_coordinate(job.pod_coordinate.x, job.pod_coordinate.y)
         pod: Pod = self.pod_manager.get_pod_by_id(job.pod.pod_id)
-        pod_info_df = pd.read_csv('pod_info.csv')
+        pod_info_records = self._fast_pod_info_records if self.fast_train else None
+        pod_info_df = None if self.fast_train else pd.read_csv('pod_info.csv')
         sku_need_replenished = []
         for order_id, sku, quantity in job.orders:
             order: Order = self.order_manager.get_order_by_id(order_id)
@@ -299,7 +315,7 @@ class Inventory(Universe):
 
             # SKU Replenished Triggered
             if(replenished_status == True): sku_need_replenished.append(sku)
-    
+
             assign_order_df = pd.read_csv('assign_order.csv')
             assign_order_df.loc[((assign_order_df['order_id'] == order.order_id) & (assign_order_df['item_id'] == sku)), 'status'] = 1
             assign_order_df.loc[((assign_order_df['order_id'] == order.order_id) & (assign_order_df['item_id'] == sku)), 'order_finished'] = int(self._tick)
@@ -312,23 +328,31 @@ class Inventory(Universe):
                 "processed_time": int(self._tick),
                 "task_type": 1
             }
-            
-            new_row_df = pd.DataFrame([new_row])
-            pod_info_df = pd.concat([pod_info_df, new_row_df], ignore_index=True)
+
+            if self.fast_train:
+                pod_info_records.append(new_row)
+            else:
+                new_row_df = pd.DataFrame([new_row])
+                pod_info_df = pd.concat([pod_info_df, new_row_df], ignore_index=True)
             
             if order.is_order_completed():
                 self.order_manager.finish_order(order_id, int(self._tick))
-                station = self.station_manager.get_station_by_id(order.station_id)
-                station.remove_order(order_id,order)
+                station_id = order.station_id or job.station_id
+                if order.station_id is None:
+                    order.assign_station(station_id)
+                station = self.station_manager.get_station_by_id(station_id)
+                station.remove_order(order_id, order)
                 self.insert_finished_order_to_csv(order)
                 # DB
                 # if not isinstance(order.order_id, int):
                     # raise AssertionError(f"WHAT? order {order} order_id {order.order_id} order_id {order_id}")
-                upsert_order_history(order_id, order_finish_time=self._tick)
+                if not self.fast_train:
+                    upsert_order_history(order_id, order_finish_time=self._tick)
         station = self.station_manager.get_station_by_id(job.station_id)
         station.remove_pod(pod.pod_id)
         
-        pod_info_df.to_csv('pod_info.csv', index=False)
+        if not self.fast_train:
+            pod_info_df.to_csv('pod_info.csv', index=False)
         # Replenishment baseline
         # job.is_finished = True
         job.set_job_finish()
@@ -344,7 +368,6 @@ class Inventory(Universe):
         # pod: Pod = self.pod_manager.get_pod_by_coordinate(job.pod_coordinate.x, job.pod_coordinate.y)
         pod: Pod = self.pod_manager.get_pod_by_id(job.pod.pod_id)
         pod.replenish_all_skus()
-        pod_info_df = pd.read_csv('pod_info.csv')
         new_row = {
                 "pod_id": pod.pod_id,
                 "item_id": -1,
@@ -353,10 +376,14 @@ class Inventory(Universe):
                 "processed_time": int(self._tick),
                 "task_type": 2
             }
-            
-        new_row_df = pd.DataFrame([new_row])
-        pod_info_df = pd.concat([pod_info_df, new_row_df], ignore_index=True)
-        pod_info_df.to_csv('pod_info.csv', index= False)
+
+        if self.fast_train:
+            self._fast_pod_info_records.append(new_row)
+        else:
+            pod_info_df = pd.read_csv('pod_info.csv')
+            new_row_df = pd.DataFrame([new_row])
+            pod_info_df = pd.concat([pod_info_df, new_row_df], ignore_index=True)
+            pod_info_df.to_csv('pod_info.csv', index= False)
         # job.is_finished = True
         job.set_job_finish()
         station = self.station_manager.get_station_by_id(job.station_id)
@@ -364,6 +391,9 @@ class Inventory(Universe):
         return False
 
     def insert_finished_order_to_csv(self, order: Order):
+        if self.fast_train:
+            self._fast_finished_orders.append(order)
+            return
         header = ["order_id", "order_arrival", "process_start_time", "order_complete_time", "station_id"]
         data = [order.order_id, order.order_arrival, order.process_start_time, order.order_complete_time,
                 order.station_id]
@@ -403,7 +433,8 @@ class Inventory(Universe):
 
             self.order_manager.add_order(order)
             # DB
-            upsert_order_history(order.order_id, arrival_time=self._tick)
+            if not self.fast_train:
+                upsert_order_history(order.order_id, arrival_time=self._tick)
 
         return new_orders
 
@@ -467,12 +498,12 @@ class Inventory(Universe):
                 self.last_order[st.station_id] = advanced_table.loc[advanced_table['station_id'] == st.station_id, 'order_id'].tolist()
             print(self.last_order)
         # Step 6: Start unfinished orders
-        assign_order_df = pd.read_csv('assign_order.csv')
         for order in self.order_manager.unfinished_orders:
             if order.station_id is None:
                 continue
             if order.process_start_time <= 0:
                 order.start_processing(int(self._tick))
+        assign_order_df = pd.read_csv('assign_order.csv')
         assign_order_df.to_csv('assign_order.csv', index=False)
         # Step 7: Process PPS logic (skip when RL controls PPS)
         if self.pps_rl:
@@ -787,8 +818,11 @@ class Inventory(Universe):
                 for o_id, qty in sku_to_list_order_id_and_quantity[sku]:
                     if tmp <= 0:
                         break
+                    order = self.order_manager.get_order_by_id(o_id)
+                    if order.station_id is None:
+                        order.assign_station(station.station_id)
                     # order.commit_quantity
-                    self.order_manager.get_order_by_id(o_id).commit_quantity(sku, min(qty, tmp))
+                    order.commit_quantity(sku, min(qty, tmp))
                     # job.add_picking_tas
                     job.add_picking_task(o_id, sku, min(qty, tmp))
                     tmp = tmp - min(qty, tmp)
@@ -881,6 +915,8 @@ class Inventory(Universe):
         return ranked_pods[0]
 
     def write_to_csv(self, filename, header, data):
+        if self.fast_train:
+            return
         # Use CWD-relative 'output/' so SubprocVecEnv workers each have their own.
         folder_path = os.path.join(os.getcwd(), 'output')
         if not os.path.exists(folder_path):
@@ -1121,7 +1157,8 @@ class Inventory(Universe):
                 assign_order_df.loc[assign_order_df['order_id'] == order.order_id, 'assigned_station'] = picker_name
                 assign_order_df.loc[assign_order_df['order_id'] == order.order_id, 'status'] = -1
                 # DB
-                upsert_order_history(order_id, assigned_station=picker_name, order_assigned_time=self._tick)
+                if not self.fast_train:
+                    upsert_order_history(order_id, assigned_station=picker_name, order_assigned_time=self._tick)
             
         assign_order_df.to_csv('assign_order.csv', index=False)
 
@@ -1707,14 +1744,15 @@ class Inventory(Universe):
                     print(order_candidates)
                     # with open('preassign_record.txt', 'a') as f:
                     #     f.write(f"[tick {self._tick}]current {current_picker} order {idx} score {val} bestpicker {best_picker} score {best_value}\n")
-                    insert_pre_assign(
-                        self._tick,
-                        current_picker,
-                        idx,
-                        val,
-                        best_picker,
-                        best_value
-                    )
+                    if not self.fast_train:
+                        insert_pre_assign(
+                            self._tick,
+                            current_picker,
+                            idx,
+                            val,
+                            best_picker,
+                            best_value
+                        )
                     self.preassign_per_station[best_picker].append(idx)
                     next_bin_counts[best_picker] -= 1
                     # raise AssertionError
@@ -1733,20 +1771,51 @@ class Inventory(Universe):
         return
     
     def update_robot_job_for_new_orders(self, job: RobotJob):
-        return
-        station: Station = self.station_manager.get_station_by_id(job.station_id)
-        orders: list[Order] = station.get_orders_in_station()
+        if not self.dynamic_job_update_enabled:
+            return 0
+        if job is None or job.is_finished:
+            return 0
+
+        try:
+            station: Station = self.station_manager.get_station_by_id(job.station_id)
+        except KeyError:
+            return 0
+        if station is None or not station.is_picker_station():
+            return 0
+
+        pod: Pod = job.pod
+        if pod is None or not any(
+            details.get("current_qty", 0) > 0
+            for details in pod.skus.values()
+        ):
+            return 0
+
+        added_tasks = 0
+        existing_order_skus = {
+            (order_id, sku)
+            for order_id, sku, qty in job.orders
+            if qty > 0
+        }
+        orders: list[Order] = station.get_orders_in_station() or []
         for order in orders:
             remaining_skus = order.get_remaining_skus()
             for sku, qty in remaining_skus.items():
-                pod: Pod = job.pod
-                if sku in pod.skus:
-                    if pod.get_quantity(sku) >= qty:
-                        quantity_to_take = qty
-                    else:
-                        quantity_to_take = pod.get_quantity(sku)
-                    order.commit_quantity(sku, quantity_to_take)
-                    job.add_picking_task(order.order_id, sku, quantity_to_take)
-                    pod.pick_sku(sku, quantity_to_take)
-                    self.pod_manager.reduce_sku_data(sku, quantity_to_take)
-                    station.reduce_sku_from_station(sku, quantity_to_take)
+                if (order.order_id, sku) in existing_order_skus:
+                    continue
+                if sku not in pod.skus:
+                    continue
+
+                available_qty = pod.get_quantity(sku)
+                quantity_to_take = min(available_qty, qty)
+                if quantity_to_take <= 0:
+                    continue
+
+                order.commit_quantity(sku, quantity_to_take)
+                job.add_picking_task(order.order_id, sku, quantity_to_take)
+                pod.pick_sku(sku, quantity_to_take)
+                self.pod_manager.reduce_sku_data(sku, quantity_to_take)
+                station.reduce_sku_from_station(sku, quantity_to_take)
+                existing_order_skus.add((order.order_id, sku))
+                added_tasks += 1
+
+        return added_tasks

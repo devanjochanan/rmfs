@@ -50,11 +50,17 @@ from torch.utils.tensorboard import SummaryWriter
 from pps_env import PPSEnv
 
 try:
-    from pps_env import ALPHA_OCT, PICKED_QTY_WEIGHT, POD_VISIT_PENALTY
+    from pps_env import (
+        ALPHA_OCT,
+        FAST_TRAIN_MODE,
+        PICKED_QTY_WEIGHT,
+        POD_VISIT_PENALTY,
+    )
 except ImportError:
     PICKED_QTY_WEIGHT = 0.0
     ALPHA_OCT = 1.0
     POD_VISIT_PENALTY = 0.0
+    FAST_TRAIN_MODE = False
 
 
 _PPS_ENV_INIT_ARGS = set(inspect.signature(PPSEnv.__init__).parameters)
@@ -122,6 +128,8 @@ class MetricsRecorder:
     HEADER = [
         "episode", "timestamp",
         "throughput", "cumulative_path_cost",
+        "total_flow_time_cost", "completed_orders_time_sum",
+        "unfinished_orders_age_sum", "reward_flow_time_cost_delta",
         "pile_on_rate", "pile_on_items", "picked_quantity", "pile_on_visits",
         "reward_picked_qty_delta", "reward_pod_visits_delta",
         "reward_avg_completion_time_delta",
@@ -141,6 +149,10 @@ class MetricsRecorder:
             datetime.now().isoformat(),
             info.get("throughput", 0),
             info.get("cumulative_path_cost", 0.0),
+            info.get("total_flow_time_cost", 0.0),
+            info.get("completed_orders_time_sum", 0.0),
+            info.get("unfinished_orders_age_sum", 0.0),
+            info.get("reward_flow_time_cost_delta", 0.0),
             info.get("pile_on_rate", 0.0),
             info.get("pile_on_items", 0),
             info.get("picked_quantity", info.get("pile_on_items", 0)),
@@ -165,8 +177,8 @@ class PPSMetricsCallback(BaseCallback):
     Tracks per-episode metrics inside SB3's training loop.
 
     TensorBoard sections:
-      pps_reward/   : total_reward, pile_on_rate, avg_order_completion_time
-      pps_metrics/  : throughput, cumulative_path_cost, episode_steps
+      pps_reward/   : total_reward, total_flow_time_cost, completed_orders_time_sum
+      pps_metrics/  : throughput, cumulative_path_cost, episode_steps, pile_on_rate
     """
 
     def __init__(
@@ -211,19 +223,19 @@ class PPSMetricsCallback(BaseCallback):
 
                 throughput = info.get("throughput", 0)
                 pile_on = info.get("pile_on_rate", 0.0)
-                picked_quantity = info.get("picked_quantity", info.get("pile_on_items", 0))
                 pod_visits = info.get("pile_on_visits", 0)
                 avg_oct = info.get("avg_order_completion_time", 0.0)
+                total_flow_time_cost = info.get("total_flow_time_cost", 0.0)
+                completed_orders_time_sum = info.get("completed_orders_time_sum", 0.0)
                 cpc = info.get("cumulative_path_cost", 0.0)
 
                 # TensorBoard
                 if self._tb_writer is not None:
                     self._tb_writer.add_scalar("pps_reward/total_reward", ep_reward, ep)
-                    self._tb_writer.add_scalar("pps_reward/picked_quantity", picked_quantity, ep)
-                    self._tb_writer.add_scalar("pps_reward/pod_visits", pod_visits, ep)
-                    self._tb_writer.add_scalar("pps_reward/pile_on_rate", pile_on, ep)
-                    self._tb_writer.add_scalar("pps_reward/avg_order_completion_time", avg_oct, ep)
+                    self._tb_writer.add_scalar("pps_reward/total_flow_time_cost", total_flow_time_cost, ep)
+                    self._tb_writer.add_scalar("pps_reward/completed_orders_time_sum", completed_orders_time_sum, ep)
                     self._tb_writer.add_scalar("pps_metrics/throughput", throughput, ep)
+                    self._tb_writer.add_scalar("pps_metrics/pile_on_rate", pile_on, ep)
                     self._tb_writer.add_scalar("pps_metrics/cumulative_path_cost", cpc, ep)
                     self._tb_writer.add_scalar("pps_metrics/episode_steps", ep_steps, ep)
                     self._tb_writer.flush()
@@ -385,7 +397,7 @@ def train(
     gae_lambda: float = 0.95,
     clip_range: float = 0.2,
     target_kl: float | None = 0.03,
-    ent_coef: float = 0.01,
+    ent_coef: float = 0.001,
     vf_coef: float = 0.5,
     max_grad_norm: float = 0.5,
     max_episode_ticks: int = 32400,
@@ -420,7 +432,7 @@ def train(
         max_grad_norm: Gradient clipping norm.
         max_episode_ticks: Max simulation ticks per episode.
         picked_qty_weight: Reward per picked unit.
-        reward_alpha: Weight for average completion time penalty.
+        reward_alpha: Weight for assigned-order flow-time cost penalty.
         visit_penalty: Penalty per successful pod-station visit.
         n_steps: Steps per PPO rollout (set >= typical episode length).
     """
@@ -571,9 +583,14 @@ def train(
     print(f"  Clip range               : {clip_range}")
     print(f"  Target KL                : {target_kl}")
     print(f"  Entropy coef             : {ent_coef}")
-    print(f"  Reward objective         : minimize avg completion time")
+    print(f"  Reward objective         : minimize assigned-order flow-time cost")
+    print(f"  Fast training I/O        : {'on' if FAST_TRAIN_MODE else 'off'}")
+    print(
+        "  Dynamic pod-job update   : "
+        f"{'off' if os.environ.get('RMFS_DYNAMIC_JOB_UPDATE', '1').strip().lower() in {'0', 'false', 'no', 'off'} else 'on'}"
+    )
     print(f"  Reward picked qty weight : {picked_qty_weight} (inactive)")
-    print(f"  Reward OCT alpha         : {reward_alpha}")
+    print(f"  Reward flow alpha        : {reward_alpha}")
     print(f"  Reward visit penalty     : {visit_penalty} (inactive)")
     print(f"  Max episode ticks        : {max_episode_ticks}")
     print(f"  TensorBoard              : python -m tensorboard.main --logdir \"{os.path.abspath(LOG_DIR)}\"")
@@ -728,14 +745,14 @@ if __name__ == "__main__":
                         help="PPO epochs per update")
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="Discount factor")
-    parser.add_argument("--ent-coef", type=float, default=0.01,
+    parser.add_argument("--ent-coef", type=float, default=0.001,
                         help="Entropy coefficient")
     parser.add_argument("--target-kl", type=float, default=0.03,
                         help="Early-stop PPO updates above this approximate KL")
     parser.add_argument("--picked-qty-weight", type=float, default=PICKED_QTY_WEIGHT,
                         help="Inactive compatibility option; picked quantity is logged only")
     parser.add_argument("--reward-alpha", type=float, default=ALPHA_OCT,
-                        help="Weight for average completion time penalty")
+                        help="Weight for assigned-order flow-time cost penalty")
     parser.add_argument("--visit-penalty", type=float, default=POD_VISIT_PENALTY,
                         help="Inactive compatibility option; pod visits are logged only")
     parser.add_argument("--save-path", type=str, default=None,

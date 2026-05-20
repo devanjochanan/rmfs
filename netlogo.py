@@ -40,7 +40,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 ACTIVATE_NEAREST = True
 
 PPS_RL_NUM_STATIONS = 3
-PPS_RL_TOP_K_SKUS = 50
+PPS_RL_TOP_K_SKUS = 500
 PPS_RL_MAX_PODS = 60
 PPS_RL_NUM_TRAFFIC_ZONES = 5
 PPS_RL_MAX_ZONE_ROBOT_COUNT = 100.0
@@ -176,13 +176,29 @@ def _load_pps_rl_model():
 
 
 def _build_pps_rl_sku_index(universe):
-    sku_counts = {}
-    for pod in universe.pod_manager.pods:
-        for sku, details in pod.skus.items():
-            sku_counts[sku] = sku_counts.get(sku, 0) + details["current_qty"]
+    sku_ids = []
+    for csv_file, column in (("items.csv", "item_id"), ("skus_data.csv", "item_id")):
+        if not os.path.exists(csv_file):
+            continue
+        try:
+            df = pd.read_csv(csv_file, usecols=[column])
+            sku_ids = sorted(df[column].dropna().astype(int).unique().tolist())
+            if sku_ids:
+                break
+        except Exception:
+            sku_ids = []
 
-    sorted_skus = sorted(sku_counts.items(), key=lambda item: item[1], reverse=True)
-    return {sku: i for i, (sku, _) in enumerate(sorted_skus[:PPS_RL_TOP_K_SKUS])}
+    if not sku_ids:
+        sku_set = set()
+        for pod in universe.pod_manager.pods:
+            for sku in pod.skus.keys():
+                try:
+                    sku_set.add(int(sku))
+                except (TypeError, ValueError):
+                    sku_set.add(sku)
+        sku_ids = sorted(sku_set)
+
+    return {sku: i for i, sku in enumerate(sku_ids[:PPS_RL_TOP_K_SKUS])}
 
 
 def _configure_pps_rl_strategy(universe):

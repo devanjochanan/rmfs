@@ -1,0 +1,51 @@
+PPS RL 500-SKU observation and dynamic pod-job update changelog
+Date: 2026-05-20
+
+Changed files:
+- pps_env.py
+- netlogo.py
+- train_pps_rl.py
+- model/inventory.py
+
+What changed:
+- Lowered the default PPO entropy coefficient from 0.01 to 0.001.
+- Training startup output now prints whether dynamic pod-job update is on or off.
+- Expanded PPS RL SKU quantity observations from 50 SKU features to 500 SKU features.
+- PPSEnv and NetLogo now use the same 500-SKU observation shape:
+  pod_features = 60 candidate pods x (500 SKU quantities + 3 station distances + 3 station match values + 5 pod-zone values)
+  station_features = 3 picker stations x 500 SKU demand values
+- Changed the SKU feature index to be stable by SKU id, loaded from items.csv or skus_data.csv.
+  This means feature column 29 consistently represents SKU 29 instead of changing when pod quantities are randomized.
+- Updated NetLogo PPO model compatibility checks to expect the new 500-SKU observation shape.
+
+Dynamic robot-job update:
+- Reactivated update_robot_job_for_new_orders(job) with safety checks.
+- The behavior is controlled by environment variable RMFS_DYNAMIC_JOB_UPDATE.
+  Default: enabled.
+  Disable with RMFS_DYNAMIC_JOB_UPDATE=0.
+- Existing queued or active pod jobs can now absorb newly assigned station orders if:
+  the target station is a picker station,
+  the job is not finished,
+  the pod still has positive SKU quantity,
+  the station has orders with uncommitted demand,
+  and the pod contains the demanded SKU.
+- When a compatible new demand is found, the function:
+  commits the order quantity,
+  appends the order/SKU/quantity to the existing RobotJob,
+  reduces the pod SKU quantity,
+  reduces global SKU data,
+  and reduces station SKU demand.
+- Duplicate order/SKU assignment inside the same job is guarded by tracking existing (order_id, sku) pairs.
+- Active robot jobs are updated after robot movement and before finish_task_in_job() is allowed to complete the job.
+- Queued jobs are also checked before robot assignment, so a pod job waiting for a robot can absorb compatible newly assigned orders.
+
+Reason:
+- The previous 50-SKU observation could hide many SKU identities from PPO, especially because the system has 500 SKU types.
+- A stable all-SKU feature map gives PPO full SKU visibility and avoids changing feature meaning across randomized episodes.
+- Lowering entropy should reduce excessive random pod choices after long training.
+- Dynamic pod-job updates allow pods already queued or traveling to a picker to serve compatible orders assigned after the original PPS decision.
+
+Important training note:
+- Existing PPO models are not compatible with the new observation shape.
+- Retrain PPO from scratch before using PPO PPS in NetLogo.
+- Evaluation comparisons with Rika PPS should be rerun after this change, because dynamic job updates affect both heuristic PPS and PPO PPS.
