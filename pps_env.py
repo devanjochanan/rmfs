@@ -479,7 +479,7 @@ class PPSEnv(gym.Env):
                     demand[sku] += qty
             station_demands[station.station_id] = demand
 
-        # Filter idle pods with at least 1 matching SKU
+        # Filter idle pods with at least 1 matching SKU.
         all_demand_skus = set()
         for d in station_demands.values():
             all_demand_skus.update(d.keys())
@@ -691,7 +691,7 @@ class PPSEnv(gym.Env):
             if not sku_to_quantity:
                 continue
 
-            # Check pod has at least 1 matching SKU
+            # Check pod has at least 1 matching SKU.
             has_match = any(
                 sku in pod.skus and pod.skus[sku]["current_qty"] > 0
                 for sku in sku_to_quantity

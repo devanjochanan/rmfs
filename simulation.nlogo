@@ -36,9 +36,15 @@ to setup
       "import netlogo"
       "item = netlogo.set_pps_mode('rika')")
   ] [
-    (py:run
-      "import netlogo"
-      "item = netlogo.set_pps_mode('ppo')")
+    ifelse pps_mode = "Random PPS" [
+      (py:run
+        "import netlogo"
+        "item = netlogo.set_pps_mode('random')")
+    ] [
+      (py:run
+        "import netlogo"
+        "item = netlogo.set_pps_mode('ppo')")
+    ]
   ]
   (py:run
     "import netlogo"
@@ -132,6 +138,13 @@ to use-rika-pps
   (py:run
     "import netlogo"
     "item = netlogo.set_pps_mode('rika')")
+end
+
+to use-random-pps
+  set pps_mode "Random PPS"
+  (py:run
+    "import netlogo"
+    "item = netlogo.set_pps_mode('random')")
 end
 @#$#@#$#@
 GRAPHICS-WINDOW
@@ -396,6 +409,23 @@ BUTTON
 43
 Rika PPS
 use-rika-pps
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+1
+
+BUTTON
+1275
+10
+1370
+43
+Random PPS
+use-random-pps
 NIL
 1
 T

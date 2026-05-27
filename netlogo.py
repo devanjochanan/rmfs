@@ -77,6 +77,8 @@ def _normalize_pps_mode(mode):
     mode = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
     if mode in {"ppo", "rl", "pps_rl", "ppo_pps"}:
         return "ppo"
+    if mode in {"random", "random_pps", "untrained", "untrained_ppo", "untrained_ppo_pps"}:
+        return "random"
     if mode in {"rika", "rika_pps", "heuristic", "pile_on", "pileon", "baseline"}:
         return "heuristic"
     if mode in {"demand", "demand_pps"}:
@@ -207,18 +209,35 @@ def _configure_pps_rl_strategy(universe):
 
     if _PPS_MODE == "heuristic":
         universe.pps_rl = False
+        universe.pps_rl_random = False
         universe.pps_pileon = True
         universe.pps_demand = False
         return False
 
     if _PPS_MODE == "demand":
         universe.pps_rl = False
+        universe.pps_rl_random = False
         universe.pps_pileon = False
         universe.pps_demand = True
         return False
 
+    if _PPS_MODE == "random":
+        universe.pps_pileon = False
+        universe.pps_demand = False
+        universe.pps_rl = True
+        universe.pps_rl_random = True
+        if not hasattr(universe, "pps_picked_quantity"):
+            universe.pps_picked_quantity = 0
+        if not hasattr(universe, "pps_pod_visits"):
+            universe.pps_pod_visits = 0
+        if not _PPS_RL_ACTIVE_LOGGED:
+            print("[PPS_RANDOM] NetLogo simulation is using random PPO-style PPS.")
+            _PPS_RL_ACTIVE_LOGGED = True
+        return True
+
     if _load_pps_rl_model() is None:
         universe.pps_rl = False
+        universe.pps_rl_random = False
         universe.pps_pileon = True
         universe.pps_demand = False
         return False
@@ -226,6 +245,7 @@ def _configure_pps_rl_strategy(universe):
     universe.pps_pileon = False
     universe.pps_demand = False
     universe.pps_rl = True
+    universe.pps_rl_random = False
 
     if not hasattr(universe, "pps_rl_sku_index"):
         universe.pps_rl_sku_index = _build_pps_rl_sku_index(universe)
@@ -241,7 +261,7 @@ def _configure_pps_rl_strategy(universe):
 
 
 def set_pps_mode(mode):
-    """Switch PPS mode for NetLogo: 'ppo', 'heuristic'/'rika', or 'demand'."""
+    """Switch PPS mode: 'ppo', 'random', 'heuristic'/'rika', or 'demand'."""
     global _PPS_MODE, _PPS_RL_LOAD_ATTEMPTED, _PPS_RL_ACTIVE_LOGGED
 
     _PPS_MODE = _normalize_pps_mode(mode)
@@ -493,6 +513,15 @@ def _apply_pps_rl_policy(universe):
         return 0
     if not _pps_rl_decision_needed(universe):
         return 0
+
+    if getattr(universe, "pps_rl_random", False) or _PPS_MODE == "random":
+        actions = np.random.randint(
+            0,
+            PPS_RL_NUM_STATIONS + 1,
+            size=PPS_RL_MAX_PODS,
+            dtype=np.int64,
+        )
+        return _execute_pps_rl_actions(universe, actions)
 
     model = _load_pps_rl_model()
     if model is None:
