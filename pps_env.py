@@ -34,6 +34,7 @@ import os
 import sys
 import math
 import copy
+import random
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -174,6 +175,7 @@ class PPSEnv(gym.Env):
         reward_picked_qty_weight: float = PICKED_QTY_WEIGHT,
         reward_alpha: float = ALPHA_OCT,
         reward_visit_penalty: float = POD_VISIT_PENALTY,
+        base_seed: Optional[int] = None,
     ):
         super().__init__()
 
@@ -182,6 +184,7 @@ class PPSEnv(gym.Env):
         self.reward_picked_qty_weight = reward_picked_qty_weight
         self.reward_alpha = reward_alpha
         self.reward_visit_penalty = reward_visit_penalty
+        self.base_seed = base_seed
 
         # ---- spaces (will be refined in reset once we know pod count) ----
         self.max_pods = MAX_PODS_OBS
@@ -233,6 +236,8 @@ class PPSEnv(gym.Env):
         self._last_reward_avg_completion_time: float = 0.0
         self._last_reward_flow_time_cost_delta: float = 0.0
         self._step_count: int = 0
+        self._episode_index: int = 0
+        self._episode_seed: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Gym API
@@ -243,7 +248,14 @@ class PPSEnv(gym.Env):
         seed: Optional[int] = None,
         options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+        if seed is None and self.base_seed is not None:
+            seed = int(self.base_seed) + self._episode_index
+
         super().reset(seed=seed)
+        self._episode_seed = seed
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
 
         with _silent_sim():
             # Build a fresh warehouse
@@ -278,6 +290,7 @@ class PPSEnv(gym.Env):
 
             obs = self._build_observation()
             info = self._build_info()
+            self._episode_index += 1
         return obs, info
 
     def step(
@@ -874,4 +887,6 @@ class PPSEnv(gym.Env):
             "throughput": self._episode_orders_completed,
             "tick": self._warehouse._tick if self._warehouse else 0,
             "step": self._step_count,
+            "episode_seed": self._episode_seed,
+            "env_base_seed": self.base_seed,
         }

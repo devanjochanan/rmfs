@@ -26,6 +26,7 @@ import importlib
 import inspect
 import json
 import os
+import random
 import shutil
 import sys
 import tempfile
@@ -43,7 +44,7 @@ from tqdm import tqdm
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
-from stable_baselines3.common.utils import get_linear_fn
+from stable_baselines3.common.utils import get_linear_fn, set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from torch.utils.tensorboard import SummaryWriter
 
@@ -95,6 +96,7 @@ def make_pps_env_kwargs(
     picked_qty_weight: float,
     reward_alpha: float,
     visit_penalty: float,
+    base_seed: int | None = None,
 ) -> Dict[str, float | int]:
     """Build env kwargs compatible with both newer and older PPSEnv versions."""
     kwargs: Dict[str, float | int] = {}
@@ -106,7 +108,14 @@ def make_pps_env_kwargs(
         kwargs["reward_alpha"] = reward_alpha
     if "reward_visit_penalty" in _PPS_ENV_INIT_ARGS:
         kwargs["reward_visit_penalty"] = visit_penalty
+    if base_seed is not None and "base_seed" in _PPS_ENV_INIT_ARGS:
+        kwargs["base_seed"] = base_seed
     return kwargs
+
+
+def generate_training_seed() -> int:
+    """Generate a lightweight reproducible-run seed when --seed is omitted."""
+    return int.from_bytes(os.urandom(4), "little")
 
 # ---------------------------------------------------------------------------
 # Paths (defaults, overridable via CLI)
@@ -127,6 +136,7 @@ class MetricsRecorder:
 
     HEADER = [
         "episode", "timestamp",
+        "training_seed", "env_base_seed", "episode_seed",
         "throughput", "cumulative_path_cost",
         "total_flow_time_cost", "completed_orders_time_sum",
         "unfinished_orders_age_sum", "reward_flow_time_cost_delta",
@@ -147,6 +157,9 @@ class MetricsRecorder:
         row = [
             episode,
             datetime.now().isoformat(),
+            info.get("training_seed", ""),
+            info.get("env_base_seed", ""),
+            info.get("episode_seed", ""),
             info.get("throughput", 0),
             info.get("cumulative_path_cost", 0.0),
             info.get("total_flow_time_cost", 0.0),
@@ -190,6 +203,7 @@ class PPSMetricsCallback(BaseCallback):
         best_throughput: int = 0,
         n_envs: int = 1,
         pbar: tqdm | None = None,
+        training_seed: int | None = None,
     ):
         super().__init__(verbose)
         self._tb_writer = tb_writer
@@ -197,6 +211,7 @@ class PPSMetricsCallback(BaseCallback):
         self._best_throughput = best_throughput
         self._episode_count = episode_offset
         self._n_envs = n_envs
+        self._training_seed = training_seed
         # Per-env accumulators (support multi-env rollouts)
         self._env_reward = np.zeros(n_envs, dtype=np.float64)
         self._env_steps = np.zeros(n_envs, dtype=np.int64)
@@ -228,6 +243,8 @@ class PPSMetricsCallback(BaseCallback):
                 total_flow_time_cost = info.get("total_flow_time_cost", 0.0)
                 completed_orders_time_sum = info.get("completed_orders_time_sum", 0.0)
                 cpc = info.get("cumulative_path_cost", 0.0)
+                if self._training_seed is not None:
+                    info["training_seed"] = self._training_seed
 
                 # TensorBoard
                 if self._tb_writer is not None:
@@ -253,6 +270,7 @@ class PPSMetricsCallback(BaseCallback):
                         "vis": pod_visits,
                         "oct": f"{avg_oct:.0f}",
                         "rew": f"{ep_reward:.1f}",
+                        "seed": info.get("episode_seed", ""),
                         "t": f"{ep_elapsed:.1f}s",
                     })
 
@@ -340,6 +358,7 @@ def make_worker_env(
     picked_qty_weight: float,
     reward_alpha: float,
     visit_penalty: float,
+    base_seed: int | None,
 ):
     """Factory for SubprocVecEnv workers.
 
@@ -378,6 +397,7 @@ def make_worker_env(
             picked_qty_weight,
             reward_alpha,
             visit_penalty,
+            None if base_seed is None else base_seed + worker_id * 1_000_000,
         ))
     return _init
 
@@ -406,6 +426,7 @@ def train(
     visit_penalty: float = POD_VISIT_PENALTY,
     n_steps: int = 8192,
     n_envs: int = 1,
+    seed: int | None = None,
 ):
     """
     Train PPO for PPS using SB3's standard training loop.
@@ -441,6 +462,32 @@ def train(
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(METRICS_DIR, exist_ok=True)
 
+    # Load previous training state before env creation so resumed runs can keep
+    # the original seed sequence.
+    prev_episode_count = 0
+    prev_best_throughput = 0
+    run_name = None
+    prev_plan_total_timesteps = None
+    state_training_seed = None
+
+    if resume and os.path.exists(TRAIN_STATE_FILE):
+        with open(TRAIN_STATE_FILE, "r") as f:
+            state = json.load(f)
+        prev_episode_count = state.get("episode_count", 0)
+        prev_best_throughput = state.get("best_throughput", 0)
+        run_name = state.get("run_name", None)
+        prev_plan_total_timesteps = state.get("plan_total_timesteps", None)
+        state_training_seed = state.get("training_seed", None)
+        print(f"Restoring training state: {prev_episode_count} episodes, best throughput {prev_best_throughput}")
+        if prev_plan_total_timesteps is not None:
+            print(f"  Restored LR decay plan: {prev_plan_total_timesteps} timesteps")
+
+    training_seed = int(seed if seed is not None else (state_training_seed if state_training_seed is not None else generate_training_seed()))
+    session_base_seed = training_seed + prev_episode_count
+    random.seed(training_seed)
+    np.random.seed(training_seed)
+    set_random_seed(training_seed)
+
     # Vec env: Dummy (serial) for n_envs=1, Subproc (parallel) otherwise
     if n_envs > 1:
         base_dir = os.getcwd()
@@ -452,6 +499,7 @@ def train(
                 picked_qty_weight,
                 reward_alpha,
                 visit_penalty,
+                session_base_seed,
             )
             for i in range(n_envs)
         ]
@@ -464,25 +512,9 @@ def train(
                 picked_qty_weight,
                 reward_alpha,
                 visit_penalty,
+                session_base_seed,
             ))
         ])
-
-    # Load previous training state if resuming
-    prev_episode_count = 0
-    prev_best_throughput = 0
-    run_name = None
-    prev_plan_total_timesteps = None
-
-    if resume and os.path.exists(TRAIN_STATE_FILE):
-        with open(TRAIN_STATE_FILE, "r") as f:
-            state = json.load(f)
-        prev_episode_count = state.get("episode_count", 0)
-        prev_best_throughput = state.get("best_throughput", 0)
-        run_name = state.get("run_name", None)
-        prev_plan_total_timesteps = state.get("plan_total_timesteps", None)
-        print(f"Restoring training state: {prev_episode_count} episodes, best throughput {prev_best_throughput}")
-        if prev_plan_total_timesteps is not None:
-            print(f"  Restored LR decay plan: {prev_plan_total_timesteps} timesteps")
 
     if run_name is None:
         run_name = f"pps_ppo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -556,6 +588,7 @@ def train(
             verbose=1,
             tensorboard_log=os.path.join(LOG_DIR, run_name),
             device="cpu",
+            seed=training_seed,
         )
 
     # Pass total_timesteps so SB3's _total_timesteps equals plan_total_timesteps
@@ -583,6 +616,8 @@ def train(
     print(f"  Clip range               : {clip_range}")
     print(f"  Target KL                : {target_kl}")
     print(f"  Entropy coef             : {ent_coef}")
+    print(f"  Training seed            : {training_seed}")
+    print(f"  First episode seed       : {session_base_seed}")
     print(f"  Reward objective         : minimize assigned-order flow-time cost")
     print(f"  Fast training I/O        : {'on' if FAST_TRAIN_MODE else 'off'}")
     print(
@@ -614,6 +649,7 @@ def train(
         best_throughput=prev_best_throughput,
         n_envs=n_envs,
         pbar=pbar,
+        training_seed=training_seed,
     )
 
     # Stop after `total_episodes` episodes in THIS session (across all envs)
@@ -640,6 +676,8 @@ def train(
             "best_throughput": metrics_cb._best_throughput,
             "run_name": run_name,
             "plan_total_timesteps": plan_total_timesteps,
+            "training_seed": training_seed,
+            "next_episode_seed": training_seed + metrics_cb._episode_count,
         }, f)
 
     print(f"\nTraining complete. Final model: {final_path}")
@@ -763,6 +801,8 @@ if __name__ == "__main__":
                         help="Steps per PPO rollout (set >= typical episode length)")
     parser.add_argument("--n-envs", type=int, default=1,
                         help="Number of parallel envs (SubprocVecEnv). 1 = serial.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Base random seed. If omitted, one is generated and saved.")
 
     args = parser.parse_args()
 
@@ -801,4 +841,5 @@ if __name__ == "__main__":
             max_episode_ticks=args.max_ticks,
             n_steps=args.n_steps,
             n_envs=args.n_envs,
+            seed=args.seed,
         )

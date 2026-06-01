@@ -236,6 +236,29 @@ def run_policy(netlogo, args: argparse.Namespace, replication: int, seed: int, m
     with silence_backend(args.show_log):
         netlogo._configure_pps_rl_strategy(universe)
 
+    if mode == "ppo":
+        ppo_active = (
+            getattr(universe, "pps_rl", False)
+            and not getattr(universe, "pps_rl_random", False)
+            and not getattr(universe, "pps_pileon", False)
+        )
+        if not ppo_active:
+            raise RuntimeError(
+                "Trained PPO PPS did not activate. The backend likely fell back "
+                "to Rika PPS because the PPO model was missing, incompatible, or "
+                "failed to load. Check the model path and rerun with --show-log. "
+                f"Current PPO model path: {getattr(netlogo, 'PPS_RL_MODEL_PATH', '')}"
+            )
+
+    if mode == "random":
+        random_active = (
+            getattr(universe, "pps_rl", False)
+            and getattr(universe, "pps_rl_random", False)
+            and not getattr(universe, "pps_pileon", False)
+        )
+        if not random_active:
+            raise RuntimeError("Random PPO-style PPS did not activate.")
+
     run_start = time.perf_counter()
     last_progress = run_start
     backend_steps = 0

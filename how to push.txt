@@ -3,11 +3,11 @@ From the PC, use the correct repo folder:
 cd ~/Documents/rmfs-latest
 
 Then run:
-git status
+
 
 If it shows files you changed, commit and push:
 git add .
-git commit -m "Update RMFS simulation"
+git commit -m "Update RMFS simulation 1 June"
 git push origin tugas-akhir
 
 That’s the main flow.

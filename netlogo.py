@@ -66,6 +66,28 @@ _PPS_RL_MODEL = None
 _PPS_RL_LOAD_ATTEMPTED = False
 _PPS_RL_ACTIVE_LOGGED = False
 _PPS_MODE = os.environ.get("PPS_MODE", "ppo").strip().lower()
+_SIM_SEED = (
+    int(os.environ["RMFS_SIM_SEED"])
+    if os.environ.get("RMFS_SIM_SEED", "").strip()
+    else None
+)
+
+
+def set_sim_seed(seed):
+    """Set the Python backend random seed before setup() for reproducible runs."""
+    global _SIM_SEED
+
+    _SIM_SEED = int(seed)
+    random.seed(_SIM_SEED)
+    np.random.seed(_SIM_SEED)
+    print(f"[SIM_SEED] Current simulation seed: {_SIM_SEED}")
+    return _SIM_SEED
+
+
+def _apply_sim_seed():
+    if _SIM_SEED is not None:
+        random.seed(_SIM_SEED)
+        np.random.seed(_SIM_SEED)
 
 
 def _pps_rl_enabled():
@@ -1355,6 +1377,7 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
 
 def setup():
     try:
+        _apply_sim_seed()
         # Initiate DB
         from datetime import datetime
 

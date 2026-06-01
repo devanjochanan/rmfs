@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional PPO .zip model path. Defaults to saved_models/pps_rl_best.zip.",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional simulation seed to apply before backend setup.",
+    )
+    parser.add_argument(
         "--normal-io",
         action="store_true",
         help="Disable RMFS_FAST_TRAIN and run with normal CSV/database I/O.",
@@ -67,6 +73,8 @@ def main() -> None:
 
     if args.model_path:
         os.environ["PPS_RL_MODEL_PATH"] = args.model_path
+    if args.seed is not None:
+        os.environ["RMFS_SIM_SEED"] = str(args.seed)
 
     import netlogo
 
@@ -85,6 +93,8 @@ def main() -> None:
 
     setup_start = time.perf_counter()
     with maybe_silence_logs():
+        if args.seed is not None:
+            netlogo.set_sim_seed(args.seed)
         netlogo.set_pps_mode(args.mode)
         setup_result = netlogo.setup()
 
@@ -134,6 +144,7 @@ def main() -> None:
     total_elapsed = time.perf_counter() - setup_start
 
     print(f"Mode: {args.mode}")
+    print(f"Seed: {args.seed if args.seed is not None else ''}")
     print(f"Fast training I/O: {'off' if args.normal_io else 'on'}")
     print(f"Backend steps: {backend_steps}")
     print(f"Simulation tick: {universe._tick:.2f}")

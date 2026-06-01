@@ -21,15 +21,23 @@ globals [
   pile_on_rate
   picked_quantity
   pps_mode
+  sim_seed
   station1_orders
   station2_orders
   station3_orders
 ]
 
 to setup
+  let requested_seed sim_seed
   ca
+  set sim_seed requested_seed
   let result ""
   py:setup py:python3
+  if sim_seed != 0 [
+    (py:run
+      "import netlogo"
+      (word "netlogo.set_sim_seed(" sim_seed ")"))
+  ]
   if pps_mode = 0 [ set pps_mode "PPO PPS" ]
   ifelse pps_mode = "Rika PPS" [
     (py:run
